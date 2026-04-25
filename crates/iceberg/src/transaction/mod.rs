@@ -59,6 +59,7 @@ mod snapshot;
 mod sort_order;
 mod update_location;
 mod update_properties;
+mod replace_schema;
 mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
@@ -72,12 +73,12 @@ pub use update_schema::AddColumn;
 use crate::error::Result;
 use crate::spec::TableProperties;
 use crate::table::Table;
-use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
+use crate::transaction::replace_schema::ReplaceSchemaAction;
 use crate::transaction::update_schema::UpdateSchemaAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
@@ -169,6 +170,15 @@ impl Transaction {
     /// Expire snapshots from the table metadata.
     pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
         ExpireSnapshotsAction::new()
+    }
+
+    /// Replace the table's current schema with a new target schema.
+    ///
+    /// The caller is responsible for constructing a schema that's a valid
+    /// evolution of the current one — this action does not enforce
+    /// schema-evolution compatibility rules.
+    pub fn replace_schema(&self) -> ReplaceSchemaAction {
+        ReplaceSchemaAction::new()
     }
 
     /// Commit transaction.
