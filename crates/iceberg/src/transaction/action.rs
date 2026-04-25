@@ -26,7 +26,7 @@ use crate::transaction::Transaction;
 use crate::{Result, TableRequirement, TableUpdate};
 
 /// A boxed, thread-safe reference to a `TransactionAction`.
-pub(crate) type BoxedTransactionAction = Arc<dyn TransactionAction>;
+pub type BoxedTransactionAction = Arc<dyn TransactionAction>;
 
 /// A trait representing an atomic action that can be part of a transaction.
 ///
@@ -34,7 +34,7 @@ pub(crate) type BoxedTransactionAction = Arc<dyn TransactionAction>;
 /// Each action is responsible for generating the updates and requirements needed
 /// to modify the table metadata.
 #[async_trait]
-pub(crate) trait TransactionAction: AsAny + Sync + Send {
+pub trait TransactionAction: AsAny + Sync + Send {
     /// Commits this action against the provided table and returns the resulting updates.
     /// NOTE: This function is intended for internal use only and should not be called directly by users.
     ///
