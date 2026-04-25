@@ -114,6 +114,10 @@ pub(crate) struct SnapshotProducer<'a> {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    /// Equality- and position-delete files added in this snapshot. Written
+    /// to a separate manifest from `added_data_files` because the Iceberg
+    /// spec forbids mixing data and delete entries in one manifest.
+    added_delete_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -127,6 +131,7 @@ impl<'a> SnapshotProducer<'a> {
         key_metadata: Option<Vec<u8>>,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
+        added_delete_files: Vec<DataFile>,
     ) -> Self {
         Self {
             table,
@@ -135,18 +140,16 @@ impl<'a> SnapshotProducer<'a> {
             key_metadata,
             snapshot_properties,
             added_data_files,
+            added_delete_files,
             manifest_counter: (0..),
         }
     }
 
-    pub(crate) fn validate_added_data_files(&self) -> Result<()> {
-        for data_file in &self.added_data_files {
-            if data_file.content_type() != crate::spec::DataContentType::Data {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Only data content type is allowed for fast append",
-                ));
-            }
+    /// Validate partition spec / partition value compatibility for a slice of
+    /// added files. Generic over data vs. delete files — the Iceberg spec
+    /// validation rules are the same for both content types.
+    pub(crate) fn validate_added_files(&self, files: &[DataFile]) -> Result<()> {
+        for data_file in files {
             // Check if the data file partition spec id matches the table default partition spec id.
             if self.table.metadata().default_partition_spec_id() != data_file.partition_spec_id {
                 return Err(Error::new(
@@ -167,6 +170,7 @@ impl<'a> SnapshotProducer<'a> {
         let new_files: HashSet<&str> = self
             .added_data_files
             .iter()
+            .chain(self.added_delete_files.iter())
             .map(|df| df.file_path.as_str())
             .collect();
 
@@ -288,19 +292,25 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
-    // Write manifest file for added data files and return the ManifestFile for ManifestList.
-    async fn write_added_manifest(&mut self) -> Result<ManifestFile> {
-        let added_data_files = std::mem::take(&mut self.added_data_files);
-        if added_data_files.is_empty() {
+    /// Write a manifest file for a batch of added files, returning the
+    /// `ManifestFile` to splice into the manifest list. The caller picks the
+    /// content type — data and delete files must live in separate manifests
+    /// per the Iceberg spec.
+    async fn write_added_manifest_for(
+        &mut self,
+        added_files: Vec<DataFile>,
+        content: ManifestContentType,
+    ) -> Result<ManifestFile> {
+        if added_files.is_empty() {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files found when write an added manifest file",
+                "No added files found when writing a manifest file",
             ));
         }
 
         let snapshot_id = self.snapshot_id;
         let format_version = self.table.metadata().format_version();
-        let manifest_entries = added_data_files.into_iter().map(|data_file| {
+        let manifest_entries = added_files.into_iter().map(|data_file| {
             let builder = ManifestEntry::builder()
                 .status(crate::spec::ManifestStatus::Added)
                 .data_file(data_file);
@@ -312,7 +322,7 @@ impl<'a> SnapshotProducer<'a> {
                 builder.build()
             }
         });
-        let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
+        let mut writer = self.new_manifest_writer(content)?;
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }
@@ -329,24 +339,35 @@ impl<'a> SnapshotProducer<'a> {
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+        if self.added_data_files.is_empty()
+            && self.added_delete_files.is_empty()
+            && self.snapshot_properties.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files or added snapshot properties found when write a manifest file",
+                "No added files or snapshot properties found when writing a manifest file",
             ));
         }
 
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
         let mut manifest_files = existing_manifests;
 
-        // Process added entries.
+        // Data and delete files must go into separate manifests — Iceberg
+        // doesn't allow mixing content types in a single manifest.
         if !self.added_data_files.is_empty() {
-            let added_manifest = self.write_added_manifest().await?;
-            manifest_files.push(added_manifest);
+            let added_data_files = std::mem::take(&mut self.added_data_files);
+            manifest_files.push(
+                self.write_added_manifest_for(added_data_files, ManifestContentType::Data)
+                    .await?,
+            );
         }
-
-        // # TODO
-        // Support process delete entries.
+        if !self.added_delete_files.is_empty() {
+            let added_delete_files = std::mem::take(&mut self.added_delete_files);
+            manifest_files.push(
+                self.write_added_manifest_for(added_delete_files, ManifestContentType::Deletes)
+                    .await?,
+            );
+        }
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
@@ -375,7 +396,7 @@ impl<'a> SnapshotProducer<'a> {
 
         summary_collector.set_partition_summary_limit(partition_summary_limit);
 
-        for data_file in &self.added_data_files {
+        for data_file in self.added_data_files.iter().chain(self.added_delete_files.iter()) {
             summary_collector.add_file(
                 data_file,
                 table_metadata.current_schema().clone(),
@@ -451,9 +472,9 @@ impl<'a> SnapshotProducer<'a> {
             ),
         };
 
-        // Calling self.summary() before self.manifest_file() is important because self.added_data_files
-        // will be set to an empty vec after self.manifest_file() returns, resulting in an empty summary
-        // being generated.
+        // Calling self.summary() before self.manifest_file() is important because the
+        // added_*_files vecs are drained by self.manifest_file(), which would result in
+        // an empty summary being generated otherwise.
         let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
             Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
         })?;
