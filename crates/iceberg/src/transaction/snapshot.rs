@@ -81,9 +81,14 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// - **Append operations**: Typically include all existing manifests
     /// - **Overwrite operations**: May exclude manifests for partitions being overwritten
     /// - **Delete operations**: May exclude manifests for partitions being deleted
+    /// Returns existing manifest files that should be included in the new
+    /// snapshot. Takes `&mut SnapshotProducer` so implementations that
+    /// rewrite manifests in place (e.g. `Replace`) can call helpers like
+    /// `write_existing_manifest_for` here. Append-style implementations
+    /// that only need read access can ignore the mutability.
     fn existing_manifest(
         &self,
-        snapshot_produce: &SnapshotProducer<'_>,
+        snapshot_produce: &mut SnapshotProducer<'_>,
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
@@ -292,6 +297,47 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
+    /// Write a fresh manifest containing `survivors` as `Existing` entries.
+    /// Used by replace/rewrite operations that drop some files from a prior
+    /// manifest while preserving the rest. Each survivor must carry its
+    /// original `snapshot_id` and `sequence_number` (load_manifest's inherit
+    /// pass populates these from the manifest list entry, so feeding raw
+    /// `manifest.entries()` here is safe).
+    pub(crate) async fn write_existing_manifest_for(
+        &mut self,
+        survivors: Vec<ManifestEntry>,
+        content: ManifestContentType,
+    ) -> Result<ManifestFile> {
+        if survivors.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No survivor entries when rewriting an existing manifest",
+            ));
+        }
+        let mut writer = self.new_manifest_writer(content)?;
+        for entry in survivors {
+            let snapshot_id = entry.snapshot_id().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "manifest entry missing snapshot_id when rewriting as existing",
+                )
+            })?;
+            let sequence_number = entry.sequence_number().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "manifest entry missing sequence_number when rewriting as existing",
+                )
+            })?;
+            writer.add_existing_file(
+                entry.data_file().clone(),
+                snapshot_id,
+                sequence_number,
+                entry.file_sequence_number,
+            )?;
+        }
+        writer.write_manifest_file().await
+    }
+
     /// Write a manifest file for a batch of added files, returning the
     /// `ManifestFile` to splice into the manifest list. The caller picks the
     /// content type — data and delete files must live in separate manifests
@@ -349,6 +395,9 @@ impl<'a> SnapshotProducer<'a> {
             ));
         }
 
+        // Existing-manifest selection runs first because Replace operations
+        // may write rewritten manifests via `&mut self` here; the added-file
+        // manifest write below comes after to keep ordering deterministic.
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
         let mut manifest_files = existing_manifests;
 

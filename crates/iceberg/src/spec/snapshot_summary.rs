@@ -335,9 +335,14 @@ pub(crate) fn update_snapshot_summaries(
     previous_summary: Option<&Summary>,
     truncate_full_table: bool,
 ) -> Result<Summary> {
-    // Validate that the operation is supported
+    // Validate that the operation is supported. `Replace` is treated like
+    // `Overwrite` for summary-update purposes — both swap files in/out
+    // without changing logical contents — but we keep them distinct in
+    // the snapshot summary so MoR tooling can distinguish compaction
+    // (`replace`) from logical overwrites (`overwrite`).
     if summary.operation != Operation::Append
         && summary.operation != Operation::Overwrite
+        && summary.operation != Operation::Replace
         && summary.operation != Operation::Delete
     {
         return Err(Error::new(
