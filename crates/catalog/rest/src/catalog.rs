@@ -848,6 +848,12 @@ impl Catalog for RestCatalog {
             }
         };
 
+        // Stash the response-side config map BEFORE merging it with
+        // the catalog-level user_config — `Table::properties()`
+        // surfaces *only* the per-table response props so downstream
+        // consumers can spot vended credentials without re-issuing
+        // the request.
+        let response_config = response.config.clone();
         let config = response
             .config
             .into_iter()
@@ -862,7 +868,8 @@ impl Catalog for RestCatalog {
             .identifier(table_ident.clone())
             .file_io(file_io)
             .metadata(response.metadata)
-            .runtime(self.runtime.clone());
+            .runtime(self.runtime.clone())
+            .properties(response_config);
 
         if let Some(metadata_location) = response.metadata_location {
             table_builder.metadata_location(metadata_location).build()
