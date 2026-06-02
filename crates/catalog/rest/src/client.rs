@@ -17,16 +17,143 @@
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::str::FromStr;
 
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::RestCatalogConfig;
 use crate::types::{ErrorResponse, TokenResponse};
+
+/// AWS SigV4 request signer for AWS-native Iceberg REST endpoints
+/// (S3 Tables, Glue). Credentials come from the standard AWS chain
+/// (env, ECS/EKS task role, EC2 IMDS, shared config), loaded lazily on
+/// first use and cached for the process lifetime.
+struct SigV4Signer {
+    region: String,
+    name: String,
+    provider: OnceCell<aws_credential_types::provider::SharedCredentialsProvider>,
+}
+
+impl SigV4Signer {
+    fn new(region: String, name: String) -> Self {
+        Self {
+            region,
+            name,
+            provider: OnceCell::new(),
+        }
+    }
+
+    async fn provider(
+        &self,
+    ) -> Result<&aws_credential_types::provider::SharedCredentialsProvider> {
+        self.provider
+            .get_or_try_init(|| async {
+                let cfg =
+                    aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                cfg.credentials_provider().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "no AWS credentials provider for SigV4 signing",
+                    )
+                })
+            })
+            .await
+    }
+
+    /// Sign `request` in place: adds `authorization`, `x-amz-date`, and
+    /// `x-amz-content-sha256` headers computed over the request as it
+    /// currently stands. Must be called after all other headers/body
+    /// are set and before sending.
+    async fn sign(&self, request: &mut Request) -> Result<()> {
+        use aws_credential_types::provider::ProvideCredentials;
+        use aws_sigv4::http_request::{
+            sign, PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings,
+        };
+        use aws_sigv4::sign::v4;
+
+        let creds = self
+            .provider()
+            .await?
+            .provide_credentials()
+            .await
+            .map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "load AWS credentials").with_source(e)
+            })?;
+        let identity: aws_smithy_runtime_api::client::identity::Identity = creds.into();
+
+        let mut settings = SigningSettings::default();
+        // AWS-native catalogs (S3 Tables/Glue) expect the payload hash.
+        settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+
+        let params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(&self.region)
+            .name(&self.name)
+            .time(std::time::SystemTime::now())
+            .settings(settings)
+            .build()
+            .map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "build SigV4 params").with_source(e)
+            })?
+            .into();
+
+        let body_bytes = request
+            .body()
+            .and_then(|b| b.as_bytes())
+            .unwrap_or(&[])
+            .to_vec();
+        let uri = request.url().as_str().to_string();
+        let method = request.method().as_str().to_string();
+        let headers: Vec<(String, String)> = request
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+
+        let signable = SignableRequest::new(
+            &method,
+            &uri,
+            headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            SignableBody::Bytes(&body_bytes),
+        )
+        .map_err(|e| {
+            Error::new(ErrorKind::Unexpected, "build signable request").with_source(e)
+        })?;
+
+        let (instructions, _signature) = sign(signable, &params)
+            .map_err(|e| Error::new(ErrorKind::Unexpected, "SigV4 sign").with_source(e))?
+            .into_parts();
+
+        // Apply the signing headers onto a throwaway http::Request that
+        // mirrors the outgoing one, then copy the resulting headers back.
+        let mut http_req = http::Request::builder()
+            .method(request.method().clone())
+            .uri(uri.as_str());
+        for (k, v) in request.headers().iter() {
+            http_req = http_req.header(k, v);
+        }
+        let mut http_req = http_req.body(()).map_err(|e| {
+            Error::new(ErrorKind::Unexpected, "build http request for signing").with_source(e)
+        })?;
+        instructions.apply_to_request_http1x(&mut http_req);
+
+        for (k, v) in http_req.headers().iter() {
+            let name = HeaderName::from_str(k.as_str()).map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "signed header name").with_source(e)
+            })?;
+            let val = HeaderValue::from_bytes(v.as_bytes()).map_err(|e| {
+                Error::new(ErrorKind::Unexpected, "signed header value").with_source(e)
+            })?;
+            request.headers_mut().insert(name, val);
+        }
+        Ok(())
+    }
+}
 
 pub(crate) struct HttpClient {
     client: Client,
@@ -45,6 +172,8 @@ pub(crate) struct HttpClient {
     extra_oauth_params: HashMap<String, String>,
     /// Whether to disable header redaction in error logs (defaults to false for security).
     disable_header_redaction: bool,
+    /// AWS SigV4 signer, set when `rest.sigv4-enabled` is configured.
+    sigv4: Option<SigV4Signer>,
 }
 
 impl Debug for HttpClient {
@@ -68,6 +197,9 @@ impl HttpClient {
             extra_headers,
             extra_oauth_params: cfg.extra_oauth_params(),
             disable_header_redaction: cfg.disable_header_redaction(),
+            sigv4: cfg
+                .sigv4_config()
+                .map(|(region, name)| SigV4Signer::new(region, name)),
         })
     }
 
@@ -96,6 +228,10 @@ impl HttpClient {
                 self.extra_oauth_params
             },
             disable_header_redaction: cfg.disable_header_redaction(),
+            sigv4: cfg
+                .sigv4_config()
+                .map(|(region, name)| SigV4Signer::new(region, name))
+                .or(self.sigv4),
         })
     }
 
@@ -253,6 +389,10 @@ impl HttpClient {
     /// Executes the given `Request` and returns a `Response`.
     pub async fn execute(&self, mut request: Request) -> Result<Response> {
         request.headers_mut().extend(self.extra_headers.clone());
+        // SigV4 must sign last, over the final headers + body.
+        if let Some(signer) = &self.sigv4 {
+            signer.sign(&mut request).await?;
+        }
         Ok(self.client.execute(request).await?)
     }
 
