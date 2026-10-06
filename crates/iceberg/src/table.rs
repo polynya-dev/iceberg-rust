@@ -17,6 +17,7 @@
 
 //! Table API for Apache Iceberg
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::arrow::ArrowReaderBuilder;
@@ -43,6 +44,7 @@ pub struct TableBuilder {
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
     runtime: Option<Runtime>,
+    properties: HashMap<String, String>,
 }
 
 impl TableBuilder {
@@ -57,6 +59,7 @@ impl TableBuilder {
             disable_cache: false,
             cache_size_bytes: None,
             runtime: None,
+            properties: HashMap::new(),
         }
     }
 
@@ -120,6 +123,15 @@ impl TableBuilder {
         self
     }
 
+    /// optional - per-table properties returned by the catalog (e.g. the
+    /// `config` map from a REST `loadTable` response, which carries
+    /// vended S3 credentials when the catalog is asked for delegated
+    /// access).
+    pub fn properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.properties = properties;
+        self
+    }
+
     /// build the Table
     pub fn build(self) -> Result<Table> {
         let Self {
@@ -132,6 +144,7 @@ impl TableBuilder {
             disable_cache,
             cache_size_bytes,
             runtime,
+            properties,
         } = self;
 
         let Some(file_io) = file_io else {
@@ -192,6 +205,7 @@ impl TableBuilder {
             object_cache,
             runtime,
             encryption_manager,
+            properties,
         })
     }
 }
@@ -207,6 +221,13 @@ pub struct Table {
     object_cache: Arc<ObjectCache>,
     runtime: Runtime,
     encryption_manager: Option<Arc<EncryptionManager>>,
+    /// Per-table properties returned by the catalog. For REST catalogs,
+    /// this is the `config` map in the `loadTable` response — empty for
+    /// catalogs that don't surface table-scoped config (file, glue,
+    /// memory). Useful for downstream consumers that need to extract
+    /// vended credentials (`s3.access-key-id`, `s3.session-token`,
+    /// etc.) without re-issuing the REST request.
+    properties: HashMap<String, String>,
 }
 
 impl Table {
@@ -260,6 +281,17 @@ impl Table {
     /// Returns file io used in this table.
     pub fn file_io(&self) -> &FileIO {
         &self.file_io
+    }
+
+    /// Returns per-table properties returned by the catalog. For REST
+    /// catalogs, this is the `config` map from `loadTable`. Empty for
+    /// catalogs that don't surface table-scoped config.
+    ///
+    /// Polynya patch: lets downstream consumers (e.g. pg2iceberg's
+    /// vended-S3 router) extract per-table S3 credentials without
+    /// duplicating the REST request.
+    pub fn properties(&self) -> &HashMap<String, String> {
+        &self.properties
     }
 
     /// Returns this table's object cache

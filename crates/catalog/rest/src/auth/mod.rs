@@ -19,6 +19,7 @@
 //! `AuthManager`/`AuthSession` API.
 
 mod oauth2;
+mod sigv4;
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -27,12 +28,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use iceberg::Result;
 pub use oauth2::OAuth2Manager;
+pub(crate) use sigv4::sigv4_enabled;
+pub use sigv4::{REST_SIGNING_NAME, REST_SIGNING_REGION, REST_SIGV4_ENABLED, SigV4AuthManager};
 
 use crate::client::HttpClient;
 use crate::request::HttpRequest;
 
 /// `rest.auth.type` value disabling authentication.
 pub const AUTH_TYPE_NONE: &str = "none";
+/// `rest.auth.type` value selecting AWS SigV4 request signing.
+pub const AUTH_TYPE_SIGV4: &str = "sigv4";
 /// `rest.auth.type` value selecting OAuth2 token authentication.
 pub const AUTH_TYPE_OAUTH2: &str = "oauth2";
 
