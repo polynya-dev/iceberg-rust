@@ -21,7 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{Error, ErrorKind, Result};
 use crate::spec::{DataContentType, DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
@@ -46,6 +46,10 @@ use crate::transaction::{ActionCommit, TransactionAction};
 /// Added files go into a new `ManifestStatus::Added` manifest, routed by
 /// `content_type()` (Data vs. EqualityDeletes/PositionDeletes) into
 /// separate manifests as required by the spec.
+///
+/// The commit fails if a removed file is no longer in the table it lands
+/// on — another rewrite got there first, and adding this one's files too
+/// would duplicate their rows. A retried commit checks again.
 pub struct RewriteFilesAction {
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
@@ -53,6 +57,7 @@ pub struct RewriteFilesAction {
     added_data_files: Vec<DataFile>,
     added_delete_files: Vec<DataFile>,
     removed_paths: HashSet<String>,
+    data_sequence_number: Option<i64>,
 }
 
 impl RewriteFilesAction {
@@ -64,6 +69,7 @@ impl RewriteFilesAction {
             added_data_files: vec![],
             added_delete_files: vec![],
             removed_paths: HashSet::default(),
+            data_sequence_number: None,
         }
     }
 
@@ -114,6 +120,17 @@ impl RewriteFilesAction {
         self.snapshot_properties = snapshot_properties;
         self
     }
+
+    /// Give the added data files this data sequence number — the one of
+    /// the snapshot the rewrite read its files at — instead of the new
+    /// snapshot's. Their rows are the removed files' rows as of then, so
+    /// equality deletes committed since still apply to them; with the new
+    /// snapshot's number they would rise above those deletes and bring the
+    /// deleted rows back. Java's `RewriteFiles.dataSequenceNumber`.
+    pub fn set_data_sequence_number(mut self, data_sequence_number: i64) -> Self {
+        self.data_sequence_number = Some(data_sequence_number);
+        self
+    }
 }
 
 #[async_trait]
@@ -126,7 +143,8 @@ impl TransactionAction for RewriteFilesAction {
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
             self.added_delete_files.clone(),
-        );
+        )
+        .with_added_data_sequence_number(self.data_sequence_number);
 
         snapshot_producer.validate_added_files(&self.added_data_files)?;
         snapshot_producer.validate_added_files(&self.added_delete_files)?;
@@ -144,6 +162,23 @@ impl TransactionAction for RewriteFilesAction {
 
 struct RewriteFilesOperation {
     removed_paths: HashSet<String>,
+}
+
+impl RewriteFilesOperation {
+    /// The error for removed paths not all among `found`, the table's.
+    fn missing(&self, found: &HashSet<&str>) -> Error {
+        let mut missing: Vec<&str> = self
+            .removed_paths
+            .iter()
+            .map(String::as_str)
+            .filter(|p| !found.contains(p))
+            .collect();
+        missing.sort();
+        Error::new(
+            ErrorKind::CatalogCommitConflicts,
+            format!("Rewrite removes files no longer in the table: {missing:?}"),
+        )
+    }
 }
 
 impl SnapshotProduceOperation for RewriteFilesOperation {
@@ -168,6 +203,9 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         snapshot_produce: &mut SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
         let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
+            if !self.removed_paths.is_empty() {
+                return Err(self.missing(&HashSet::new()));
+            }
             return Ok(vec![]);
         };
 
@@ -197,8 +235,14 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
             },
         }
         let mut plans: Vec<Plan> = Vec::with_capacity(manifest_list_entries.len());
+        let mut found: HashSet<&str> = HashSet::new();
         for mfile in &manifest_list_entries {
             let manifest = mfile.load_manifest(&file_io).await?;
+            for entry in manifest.entries().iter().filter(|e| e.is_alive()) {
+                if let Some(path) = self.removed_paths.get(entry.data_file().file_path()) {
+                    found.insert(path);
+                }
+            }
             let total = manifest.entries().len();
             let survivors: Vec<ManifestEntry> = manifest
                 .entries()
@@ -217,6 +261,10 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                     content: mfile.content,
                 });
             }
+        }
+
+        if found.len() < self.removed_paths.len() {
+            return Err(self.missing(&found));
         }
 
         // Pass 2: materialize. Carry-forwards and rewrites land in the
@@ -242,7 +290,7 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::CatalogBuilder;
+    use crate::{Catalog, CatalogBuilder, ErrorKind};
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, ManifestContentType, NestedField,
         Operation, PrimitiveType, Schema, Struct, Type,
@@ -564,5 +612,132 @@ mod tests {
         let action = tx.rewrite_files();
         let tx = action.apply(tx).unwrap();
         assert!(tx.commit(&catalog).await.is_err());
+    }
+
+    /// With a data sequence number, the added files carry it rather than
+    /// the new snapshot's, which still becomes their file sequence number.
+    #[tokio::test]
+    async fn rewrite_gives_added_files_its_data_sequence_number() {
+        let (catalog, table) = make_memory_table().await;
+        let f1 = data_file("memory:///warehouse/public/orders/data/1.parquet", 10, 1024);
+        let f2 = data_file("memory:///warehouse/public/orders/data/2.parquet", 20, 2048);
+        let mut table = table;
+        for f in [&f1, &f2] {
+            let tx = Transaction::new(&table);
+            let action = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![f.clone()]);
+            table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+        }
+
+        // Rewrite f1 as planned at sequence number 1.
+        let compacted = data_file(
+            "memory:///warehouse/public/orders/data/compact-0.parquet",
+            10,
+            1024,
+        );
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .add_data_files(vec![compacted.clone()])
+            .remove_data_files(vec![f1.clone()])
+            .set_data_sequence_number(1);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let snap = table.metadata().current_snapshot().unwrap();
+        assert_eq!(snap.sequence_number(), 3);
+        let mlist = snap
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+        let mut seqs = Vec::new();
+        for mf in mlist.entries() {
+            let m = mf.load_manifest(table.file_io()).await.unwrap();
+            for entry in m.entries() {
+                seqs.push((
+                    entry.data_file().file_path().to_string(),
+                    entry.sequence_number(),
+                    entry.file_sequence_number,
+                ));
+            }
+        }
+        seqs.sort();
+        assert_eq!(seqs, vec![
+            (f2.file_path().to_string(), Some(2), Some(2)),
+            (compacted.file_path().to_string(), Some(1), Some(3)),
+        ]);
+    }
+
+    /// A rewrite of a file another rewrite already removed fails: adding
+    /// its files too would duplicate the rows.
+    #[tokio::test]
+    async fn rewrite_of_a_file_no_longer_in_the_table_fails() {
+        let (catalog, table) = make_memory_table().await;
+        let f1 = data_file("memory:///warehouse/public/orders/data/1.parquet", 10, 1024);
+        let tx = Transaction::new(&table);
+        let action = tx
+            .fast_append()
+            .with_check_duplicate(false)
+            .add_data_files(vec![f1.clone()]);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        // Two rewrites of f1, planned against the same table.
+        let rewrite = |path: &str| {
+            let tx = Transaction::new(&table);
+            let action = tx
+                .rewrite_files()
+                .add_data_files(vec![data_file(path, 10, 1024)])
+                .remove_data_files(vec![f1.clone()]);
+            action.apply(tx).unwrap()
+        };
+        let first = rewrite("memory:///warehouse/public/orders/data/compact-a.parquet");
+        let second = rewrite("memory:///warehouse/public/orders/data/compact-b.parquet");
+        let table = first.commit(&catalog).await.unwrap();
+        // The second lands on the first's table, without f1.
+        let err = second.commit(&catalog).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+        assert!(!err.retryable());
+
+        let table = catalog.load_table(table.identifier()).await.unwrap();
+        let snap = table.metadata().current_snapshot().unwrap();
+        let mlist = snap
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+        let mut paths = Vec::new();
+        for mf in mlist.entries() {
+            let m = mf.load_manifest(table.file_io()).await.unwrap();
+            for entry in m.entries() {
+                paths.push(entry.data_file().file_path().to_string());
+            }
+        }
+        assert_eq!(paths, vec![
+            "memory:///warehouse/public/orders/data/compact-a.parquet".to_string()
+        ]);
+    }
+
+    /// So does one removing a file from a table with no snapshot at all.
+    #[tokio::test]
+    async fn rewrite_removing_from_an_empty_table_fails() {
+        let (catalog, table) = make_memory_table().await;
+        let f1 = data_file("memory:///warehouse/public/orders/data/1.parquet", 10, 1024);
+        let compacted = data_file(
+            "memory:///warehouse/public/orders/data/compact-0.parquet",
+            10,
+            1024,
+        );
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .add_data_files(vec![compacted])
+            .remove_data_files(vec![f1]);
+        let err = action
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
     }
 }
