@@ -128,6 +128,7 @@ impl RewriteFilesAction {
 #[async_trait]
 impl TransactionAction for RewriteFilesAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        let removed_files = self.removed_files(table).await?;
         let snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
@@ -135,7 +136,8 @@ impl TransactionAction for RewriteFilesAction {
             self.added_data_files.clone(),
             self.added_delete_files.clone(),
         )
-        .with_added_data_sequence_number(self.data_sequence_number);
+        .with_added_data_sequence_number(self.data_sequence_number)
+        .with_removed_files(removed_files);
 
         snapshot_producer.validate_added_files(&self.added_data_files)?;
         snapshot_producer.validate_added_files(&self.added_delete_files)?;
@@ -151,25 +153,46 @@ impl TransactionAction for RewriteFilesAction {
     }
 }
 
-struct RewriteFilesOperation {
-    removed_paths: HashSet<String>,
+impl RewriteFilesAction {
+    /// The live files of `table` that `removed_paths` names — the snapshot
+    /// summary subtracts them. Fails if one isn't live: another rewrite
+    /// replaced it first, and committing this one's files as well would
+    /// duplicate their rows. Runs on every commit attempt, against the
+    /// table the commit would land on.
+    async fn removed_files(&self, table: &Table) -> Result<Vec<DataFile>> {
+        let mut removed = Vec::new();
+        let mut found: HashSet<&str> = HashSet::new();
+        if let Some(snapshot) = table.metadata().current_snapshot() {
+            let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+            for mfile in manifest_list.entries() {
+                let manifest = mfile.load_manifest(table.file_io()).await?;
+                for entry in manifest.entries().iter().filter(|e| e.is_alive()) {
+                    if let Some(path) = self.removed_paths.get(entry.data_file().file_path()) {
+                        found.insert(path);
+                        removed.push(entry.data_file().clone());
+                    }
+                }
+            }
+        }
+        if found.len() < self.removed_paths.len() {
+            let mut missing: Vec<&str> = self
+                .removed_paths
+                .iter()
+                .map(String::as_str)
+                .filter(|p| !found.contains(p))
+                .collect();
+            missing.sort();
+            return Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                format!("Rewrite removes files no longer in the table: {missing:?}"),
+            ));
+        }
+        Ok(removed)
+    }
 }
 
-impl RewriteFilesOperation {
-    /// The error for removed paths not all among `found`, the table's.
-    fn missing(&self, found: &HashSet<&str>) -> Error {
-        let mut missing: Vec<&str> = self
-            .removed_paths
-            .iter()
-            .map(String::as_str)
-            .filter(|p| !found.contains(p))
-            .collect();
-        missing.sort();
-        Error::new(
-            ErrorKind::CatalogCommitConflicts,
-            format!("Rewrite removes files no longer in the table: {missing:?}"),
-        )
-    }
+struct RewriteFilesOperation {
+    removed_paths: HashSet<String>,
 }
 
 impl SnapshotProduceOperation for RewriteFilesOperation {
@@ -194,9 +217,6 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         snapshot_produce: &mut SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
         let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
-            if !self.removed_paths.is_empty() {
-                return Err(self.missing(&HashSet::new()));
-            }
             return Ok(vec![]);
         };
 
@@ -225,14 +245,8 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
             },
         }
         let mut plans: Vec<Plan> = Vec::with_capacity(manifest_list_entries.len());
-        let mut found: HashSet<&str> = HashSet::new();
         for mfile in &manifest_list_entries {
             let manifest = mfile.load_manifest(&file_io).await?;
-            for entry in manifest.entries().iter().filter(|e| e.is_alive()) {
-                if let Some(path) = self.removed_paths.get(entry.data_file().file_path()) {
-                    found.insert(path);
-                }
-            }
             let total = manifest.entries().len();
             let survivors: Vec<ManifestEntry> = manifest
                 .entries()
@@ -251,10 +265,6 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                     content: mfile.content,
                 });
             }
-        }
-
-        if found.len() < self.removed_paths.len() {
-            return Err(self.missing(&found));
         }
 
         // Pass 2: materialize. Carry-forwards and rewrites land in the
@@ -730,4 +740,61 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
     }
+
+    /// The snapshot summary keeps running totals: a rewrite subtracts the
+    /// files it removes, data and deletes, and adds its outputs.
+    #[tokio::test]
+    async fn rewrite_summary_keeps_running_totals() {
+        let (catalog, table) = make_memory_table().await;
+        let f1 = data_file("memory:///warehouse/public/orders/data/1.parquet", 10, 1024);
+        let f2 = data_file("memory:///warehouse/public/orders/data/2.parquet", 20, 2048);
+        let eq_delete = DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path("memory:///warehouse/public/orders/deletes/eq.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(64)
+            .record_count(1)
+            .equality_ids(Some(vec![1]))
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .unwrap();
+        let mut table = table;
+        for files in [vec![f1.clone()], vec![f2.clone(), eq_delete.clone()]] {
+            let tx = Transaction::new(&table);
+            let action = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(files);
+            table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+        }
+        let summary = |table: &crate::table::Table, key: &str| -> String {
+            let snap = table.metadata().current_snapshot().unwrap();
+            snap.summary().additional_properties[key].clone()
+        };
+        assert_eq!(summary(&table, "total-records"), "30");
+        assert_eq!(summary(&table, "total-delete-files"), "1");
+
+        // f1 rewritten as 9 rows, retiring the delete.
+        let compacted = data_file(
+            "memory:///warehouse/public/orders/data/compact-0.parquet",
+            9,
+            1024,
+        );
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .add_data_files(vec![compacted])
+            .remove_data_files(vec![f1.clone(), eq_delete.clone()]);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        assert_eq!(summary(&table, "deleted-data-files"), "1");
+        assert_eq!(summary(&table, "deleted-records"), "10");
+        assert_eq!(summary(&table, "removed-delete-files"), "1");
+        assert_eq!(summary(&table, "total-records"), "29");
+        assert_eq!(summary(&table, "total-data-files"), "2");
+        assert_eq!(summary(&table, "total-delete-files"), "0");
+        assert_eq!(summary(&table, "total-equality-deletes"), "0");
+    }
+
 }

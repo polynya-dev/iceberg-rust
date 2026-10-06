@@ -127,6 +127,9 @@ pub(crate) struct SnapshotProducer<'a> {
     /// Data sequence number for `added_data_files`; `None` to inherit the
     /// snapshot's.
     added_data_sequence_number: Option<i64>,
+    /// Files this snapshot removes from the table, for its summary's
+    /// `deleted-*` counts and running `total-*`.
+    removed_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -149,6 +152,7 @@ impl<'a> SnapshotProducer<'a> {
             added_data_files,
             added_delete_files,
             added_data_sequence_number: None,
+            removed_files: Vec::new(),
             manifest_counter: (0..),
         }
     }
@@ -159,6 +163,12 @@ impl<'a> SnapshotProducer<'a> {
     /// Inheritance"). Ignored for v1 tables, which have none.
     pub(crate) fn with_added_data_sequence_number(mut self, seq: Option<i64>) -> Self {
         self.added_data_sequence_number = seq;
+        self
+    }
+
+    /// Record files this snapshot removes, so its summary subtracts them.
+    pub(crate) fn with_removed_files(mut self, files: Vec<DataFile>) -> Self {
+        self.removed_files = files;
         self
     }
 
@@ -485,6 +495,13 @@ impl<'a> SnapshotProducer<'a> {
                 table_metadata.current_schema().clone(),
                 table_metadata.default_partition_spec().clone(),
             );
+        }
+        for data_file in &self.removed_files {
+            let spec = table_metadata
+                .partition_spec_by_id(data_file.partition_spec_id)
+                .unwrap_or_else(|| table_metadata.default_partition_spec())
+                .clone();
+            summary_collector.remove_file(data_file, table_metadata.current_schema().clone(), spec);
         }
 
         let previous_snapshot = table_metadata.current_snapshot();
