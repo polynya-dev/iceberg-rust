@@ -124,6 +124,9 @@ pub(crate) struct SnapshotProducer<'a> {
     /// to a separate manifest from `added_data_files` because the Iceberg
     /// spec forbids mixing data and delete entries in one manifest.
     added_delete_files: Vec<DataFile>,
+    /// Data sequence number for `added_data_files`; `None` to inherit the
+    /// snapshot's.
+    added_data_sequence_number: Option<i64>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -145,8 +148,18 @@ impl<'a> SnapshotProducer<'a> {
             snapshot_properties,
             added_data_files,
             added_delete_files,
+            added_data_sequence_number: None,
             manifest_counter: (0..),
         }
+    }
+
+    /// Write the added data files with this data sequence number instead of
+    /// letting them inherit the snapshot's: their rows logically belong to
+    /// an older sequence number (see the spec's "Sequence Number
+    /// Inheritance"). Ignored for v1 tables, which have none.
+    pub(crate) fn with_added_data_sequence_number(mut self, seq: Option<i64>) -> Self {
+        self.added_data_sequence_number = seq;
+        self
     }
 
     /// Validate partition spec / partition value compatibility for a slice of
@@ -361,6 +374,7 @@ impl<'a> SnapshotProducer<'a> {
         &mut self,
         added_files: Vec<DataFile>,
         content: ManifestContentType,
+        data_sequence_number: Option<i64>,
     ) -> Result<ManifestFile> {
         if added_files.is_empty() {
             return Err(Error::new(
@@ -380,7 +394,7 @@ impl<'a> SnapshotProducer<'a> {
             } else {
                 // For format version > 1, we set the snapshot id at the inherited time to avoid rewrite the manifest file when
                 // commit failed.
-                builder.build()
+                builder.sequence_number_opt(data_sequence_number).build()
             }
         });
         let mut writer = self.new_manifest_writer(content)?;
@@ -420,16 +434,21 @@ impl<'a> SnapshotProducer<'a> {
         // doesn't allow mixing content types in a single manifest.
         if !self.added_data_files.is_empty() {
             let added_data_files = std::mem::take(&mut self.added_data_files);
+            let seq = self.added_data_sequence_number;
             manifest_files.push(
-                self.write_added_manifest_for(added_data_files, ManifestContentType::Data)
+                self.write_added_manifest_for(added_data_files, ManifestContentType::Data, seq)
                     .await?,
             );
         }
         if !self.added_delete_files.is_empty() {
             let added_delete_files = std::mem::take(&mut self.added_delete_files);
             manifest_files.push(
-                self.write_added_manifest_for(added_delete_files, ManifestContentType::Deletes)
-                    .await?,
+                self.write_added_manifest_for(
+                    added_delete_files,
+                    ManifestContentType::Deletes,
+                    None,
+                )
+                .await?,
             );
         }
 
