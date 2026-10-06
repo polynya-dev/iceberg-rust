@@ -55,6 +55,8 @@ mod action;
 pub use action::*;
 mod append;
 mod expire_snapshots;
+mod replace_schema;
+mod rewrite;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -72,9 +74,10 @@ pub use update_schema::AddColumn;
 use crate::error::Result;
 use crate::spec::TableProperties;
 use crate::table::Table;
-use crate::transaction::action::BoxedTransactionAction;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+use crate::transaction::replace_schema::ReplaceSchemaAction;
+use crate::transaction::rewrite::RewriteFilesAction;
 use crate::transaction::sort_order::ReplaceSortOrderAction;
 use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -151,6 +154,13 @@ impl Transaction {
         FastAppendAction::new()
     }
 
+    /// Creates a `RewriteFilesAction` for compaction-style replace
+    /// operations: drops a set of existing files and adds new ones in one
+    /// `Operation::Replace` snapshot.
+    pub fn rewrite_files(&self) -> RewriteFilesAction {
+        RewriteFilesAction::new()
+    }
+
     /// Creates replace sort order action.
     pub fn replace_sort_order(&self) -> ReplaceSortOrderAction {
         ReplaceSortOrderAction::new()
@@ -169,6 +179,15 @@ impl Transaction {
     /// Expire snapshots from the table metadata.
     pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
         ExpireSnapshotsAction::new()
+    }
+
+    /// Replace the table's current schema with a new target schema.
+    ///
+    /// The caller is responsible for constructing a schema that's a valid
+    /// evolution of the current one — this action does not enforce
+    /// schema-evolution compatibility rules.
+    pub fn replace_schema(&self) -> ReplaceSchemaAction {
+        ReplaceSchemaAction::new()
     }
 
     /// Commit transaction.

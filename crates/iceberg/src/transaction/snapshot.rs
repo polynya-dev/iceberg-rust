@@ -83,9 +83,14 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// - **Append operations**: Typically include all existing manifests
     /// - **Overwrite operations**: May exclude manifests for partitions being overwritten
     /// - **Delete operations**: May exclude manifests for partitions being deleted
+    ///
+    /// Takes `&mut SnapshotProducer` so implementations that rewrite
+    /// manifests in place (e.g. `Replace`) can call helpers like
+    /// `write_existing_manifest_for` here. Append-style implementations
+    /// that only need read access can ignore the mutability.
     fn existing_manifest(
         &self,
-        snapshot_produce: &SnapshotProducer<'_>,
+        snapshot_produce: &mut SnapshotProducer<'_>,
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
@@ -115,6 +120,16 @@ pub(crate) struct SnapshotProducer<'a> {
     commit_uuid: Uuid,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    /// Equality- and position-delete files added in this snapshot. Written
+    /// to a separate manifest from `added_data_files` because the Iceberg
+    /// spec forbids mixing data and delete entries in one manifest.
+    added_delete_files: Vec<DataFile>,
+    /// Data sequence number for `added_data_files`; `None` to inherit the
+    /// snapshot's.
+    added_data_sequence_number: Option<i64>,
+    /// Files this snapshot removes from the table, for its summary's
+    /// `deleted-*` counts and running `total-*`.
+    removed_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -127,6 +142,7 @@ impl<'a> SnapshotProducer<'a> {
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
+        added_delete_files: Vec<DataFile>,
     ) -> Self {
         Self {
             table,
@@ -134,18 +150,33 @@ impl<'a> SnapshotProducer<'a> {
             commit_uuid,
             snapshot_properties,
             added_data_files,
+            added_delete_files,
+            added_data_sequence_number: None,
+            removed_files: Vec::new(),
             manifest_counter: (0..),
         }
     }
 
-    pub(crate) fn validate_added_data_files(&self) -> Result<()> {
-        for data_file in &self.added_data_files {
-            if data_file.content_type() != crate::spec::DataContentType::Data {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Only data content type is allowed for fast append",
-                ));
-            }
+    /// Write the added data files with this data sequence number instead of
+    /// letting them inherit the snapshot's: their rows logically belong to
+    /// an older sequence number (see the spec's "Sequence Number
+    /// Inheritance"). Ignored for v1 tables, which have none.
+    pub(crate) fn with_added_data_sequence_number(mut self, seq: Option<i64>) -> Self {
+        self.added_data_sequence_number = seq;
+        self
+    }
+
+    /// Record files this snapshot removes, so its summary subtracts them.
+    pub(crate) fn with_removed_files(mut self, files: Vec<DataFile>) -> Self {
+        self.removed_files = files;
+        self
+    }
+
+    /// Validate partition spec / partition value compatibility for a slice of
+    /// added files. Generic over data vs. delete files — the Iceberg spec
+    /// validation rules are the same for both content types.
+    pub(crate) fn validate_added_files(&self, files: &[DataFile]) -> Result<()> {
+        for data_file in files {
             // Check if the data file partition spec id matches the table default partition spec id.
             if self.table.metadata().default_partition_spec_id() != data_file.partition_spec_id {
                 return Err(Error::new(
@@ -170,6 +201,7 @@ impl<'a> SnapshotProducer<'a> {
         let new_files: HashSet<&str> = self
             .added_data_files
             .iter()
+            .chain(self.added_delete_files.iter())
             .map(|df| df.file_path.as_str())
             .collect();
 
@@ -303,19 +335,67 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
-    // Write manifest file for added data files and return the ManifestFile for ManifestList.
-    async fn write_added_manifest(&mut self) -> Result<ManifestFile> {
-        let added_data_files = std::mem::take(&mut self.added_data_files);
-        if added_data_files.is_empty() {
+    /// Write a fresh manifest containing `survivors` as `Existing` entries.
+    /// Used by replace/rewrite operations that drop some files from a prior
+    /// manifest while preserving the rest. Each survivor must carry its
+    /// original `snapshot_id` and `sequence_number` (load_manifest's inherit
+    /// pass populates these from the manifest list entry, so feeding raw
+    /// `manifest.entries()` here is safe).
+    pub(crate) async fn write_existing_manifest_for(
+        &mut self,
+        survivors: Vec<ManifestEntry>,
+        content: ManifestContentType,
+    ) -> Result<ManifestFile> {
+        if survivors.is_empty() {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files found when write an added manifest file",
+                "No survivor entries when rewriting an existing manifest",
+            ));
+        }
+        let mut writer = self.new_manifest_writer(content)?;
+        for entry in survivors {
+            let snapshot_id = entry.snapshot_id().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "manifest entry missing snapshot_id when rewriting as existing",
+                )
+            })?;
+            let sequence_number = entry.sequence_number().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "manifest entry missing sequence_number when rewriting as existing",
+                )
+            })?;
+            writer.add_existing_file(
+                entry.data_file().clone(),
+                snapshot_id,
+                sequence_number,
+                entry.file_sequence_number,
+            )?;
+        }
+        writer.write_manifest_file().await
+    }
+
+    /// Write a manifest file for a batch of added files, returning the
+    /// `ManifestFile` to splice into the manifest list. The caller picks the
+    /// content type — data and delete files must live in separate manifests
+    /// per the Iceberg spec.
+    async fn write_added_manifest_for(
+        &mut self,
+        added_files: Vec<DataFile>,
+        content: ManifestContentType,
+        data_sequence_number: Option<i64>,
+    ) -> Result<ManifestFile> {
+        if added_files.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No added files found when writing a manifest file",
             ));
         }
 
         let snapshot_id = self.snapshot_id;
         let format_version = self.table.metadata().format_version();
-        let manifest_entries = added_data_files.into_iter().map(|data_file| {
+        let manifest_entries = added_files.into_iter().map(|data_file| {
             let builder = ManifestEntry::builder()
                 .status(crate::spec::ManifestStatus::Added)
                 .data_file(data_file);
@@ -324,10 +404,10 @@ impl<'a> SnapshotProducer<'a> {
             } else {
                 // For format version > 1, we set the snapshot id at the inherited time to avoid rewrite the manifest file when
                 // commit failed.
-                builder.build()
+                builder.sequence_number_opt(data_sequence_number).build()
             }
         });
-        let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
+        let mut writer = self.new_manifest_writer(content)?;
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }
@@ -344,24 +424,43 @@ impl<'a> SnapshotProducer<'a> {
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+        if self.added_data_files.is_empty()
+            && self.added_delete_files.is_empty()
+            && self.snapshot_properties.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files or added snapshot properties found when write a manifest file",
+                "No added files or snapshot properties found when writing a manifest file",
             ));
         }
 
+        // Existing-manifest selection runs first because Replace operations
+        // may write rewritten manifests via `&mut self` here; the added-file
+        // manifest write below comes after to keep ordering deterministic.
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
         let mut manifest_files = existing_manifests;
 
-        // Process added entries.
+        // Data and delete files must go into separate manifests — Iceberg
+        // doesn't allow mixing content types in a single manifest.
         if !self.added_data_files.is_empty() {
-            let added_manifest = self.write_added_manifest().await?;
-            manifest_files.push(added_manifest);
+            let added_data_files = std::mem::take(&mut self.added_data_files);
+            let seq = self.added_data_sequence_number;
+            manifest_files.push(
+                self.write_added_manifest_for(added_data_files, ManifestContentType::Data, seq)
+                    .await?,
+            );
         }
-
-        // # TODO
-        // Support process delete entries.
+        if !self.added_delete_files.is_empty() {
+            let added_delete_files = std::mem::take(&mut self.added_delete_files);
+            manifest_files.push(
+                self.write_added_manifest_for(
+                    added_delete_files,
+                    ManifestContentType::Deletes,
+                    None,
+                )
+                .await?,
+            );
+        }
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
@@ -390,12 +489,23 @@ impl<'a> SnapshotProducer<'a> {
 
         summary_collector.set_partition_summary_limit(partition_summary_limit);
 
-        for data_file in &self.added_data_files {
+        for data_file in self
+            .added_data_files
+            .iter()
+            .chain(self.added_delete_files.iter())
+        {
             summary_collector.add_file(
                 data_file,
                 table_metadata.current_schema().clone(),
                 table_metadata.default_partition_spec().clone(),
             );
+        }
+        for data_file in &self.removed_files {
+            let spec = table_metadata
+                .partition_spec_by_id(data_file.partition_spec_id)
+                .unwrap_or_else(|| table_metadata.default_partition_spec())
+                .clone();
+            summary_collector.remove_file(data_file, table_metadata.current_schema().clone(), spec);
         }
 
         let previous_snapshot = table_metadata.current_snapshot();
@@ -468,9 +578,9 @@ impl<'a> SnapshotProducer<'a> {
             ),
         };
 
-        // Calling self.summary() before self.manifest_file() is important because self.added_data_files
-        // will be set to an empty vec after self.manifest_file() returns, resulting in an empty summary
-        // being generated.
+        // Calling self.summary() before self.manifest_file() is important because the
+        // added_*_files vecs are drained by self.manifest_file(), which would result in
+        // an empty summary being generated otherwise.
         let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
             Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
         })?;

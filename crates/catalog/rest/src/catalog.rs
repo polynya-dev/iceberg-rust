@@ -220,6 +220,37 @@ impl RestCatalogConfig {
         self.client.clone()
     }
 
+    /// AWS SigV4 signing config, read from props. Returns
+    /// `Some((region, signing_name))` when `rest.sigv4-enabled` is
+    /// `"true"`, else `None` (no signing).
+    ///
+    /// Used for AWS-native Iceberg REST endpoints (S3 Tables signing
+    /// name `s3tables`, Glue `glue`) which require every request to be
+    /// SigV4-signed. Region falls back to `s3.region`; signing name
+    /// defaults to `execute-api`.
+    pub(crate) fn sigv4_config(&self) -> Option<(String, String)> {
+        let enabled = self
+            .props
+            .get("rest.sigv4-enabled")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let region = self
+            .props
+            .get("rest.signing-region")
+            .or_else(|| self.props.get("s3.region"))
+            .cloned()
+            .unwrap_or_else(|| "us-east-1".to_string());
+        let name = self
+            .props
+            .get("rest.signing-name")
+            .cloned()
+            .unwrap_or_else(|| "execute-api".to_string());
+        Some((region, name))
+    }
+
     /// Get the token from the config.
     ///
     /// The client can use this token to send requests.
@@ -848,6 +879,12 @@ impl Catalog for RestCatalog {
             }
         };
 
+        // Stash the response-side config map BEFORE merging it with
+        // the catalog-level user_config — `Table::properties()`
+        // surfaces *only* the per-table response props so downstream
+        // consumers can spot vended credentials without re-issuing
+        // the request.
+        let response_config = response.config.clone();
         let config = response
             .config
             .into_iter()
@@ -862,7 +899,8 @@ impl Catalog for RestCatalog {
             .identifier(table_ident.clone())
             .file_io(file_io)
             .metadata(response.metadata)
-            .runtime(self.runtime.clone());
+            .runtime(self.runtime.clone())
+            .properties(response_config);
 
         if let Some(metadata_location) = response.metadata_location {
             table_builder.metadata_location(metadata_location).build()
