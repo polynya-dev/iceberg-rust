@@ -83,9 +83,9 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// - **Append operations**: Typically include all existing manifests
     /// - **Overwrite operations**: May exclude manifests for partitions being overwritten
     /// - **Delete operations**: May exclude manifests for partitions being deleted
-    /// Returns existing manifest files that should be included in the new
-    /// snapshot. Takes `&mut SnapshotProducer` so implementations that
-    /// rewrite manifests in place (e.g. `Replace`) can call helpers like
+    ///
+    /// Takes `&mut SnapshotProducer` so implementations that rewrite
+    /// manifests in place (e.g. `Replace`) can call helpers like
     /// `write_existing_manifest_for` here. Append-style implementations
     /// that only need read access can ignore the mutability.
     fn existing_manifest(
@@ -489,7 +489,11 @@ impl<'a> SnapshotProducer<'a> {
 
         summary_collector.set_partition_summary_limit(partition_summary_limit);
 
-        for data_file in self.added_data_files.iter().chain(self.added_delete_files.iter()) {
+        for data_file in self
+            .added_data_files
+            .iter()
+            .chain(self.added_delete_files.iter())
+        {
             summary_collector.add_file(
                 data_file,
                 table_metadata.current_schema().clone(),

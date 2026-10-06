@@ -163,14 +163,10 @@ mod tests {
         let requirements = commit.take_requirements();
 
         assert_eq!(updates.len(), 2);
-        assert!(matches!(
-            updates[0],
-            crate::TableUpdate::AddSchema { .. }
-        ));
-        assert!(matches!(
-            updates[1],
-            crate::TableUpdate::SetCurrentSchema { schema_id: -1 }
-        ));
+        assert!(matches!(updates[0], crate::TableUpdate::AddSchema { .. }));
+        assert!(matches!(updates[1], crate::TableUpdate::SetCurrentSchema {
+            schema_id: -1
+        }));
 
         // Three requirements, in a fixed order.
         assert_eq!(requirements.len(), 3);

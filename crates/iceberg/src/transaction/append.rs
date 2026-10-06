@@ -539,10 +539,7 @@ mod tests {
             .unwrap();
         use crate::Catalog;
         let ns = crate::NamespaceIdent::from_strs(["public"]).unwrap();
-        memory
-            .create_namespace(&ns, HashMap::new())
-            .await
-            .unwrap();
+        memory.create_namespace(&ns, HashMap::new()).await.unwrap();
         let creation = crate::TableCreation::builder()
             .name("orders".to_string())
             .schema(schema)
@@ -562,7 +559,10 @@ mod tests {
 
         let delete_file = DataFileBuilder::default()
             .content(DataContentType::EqualityDeletes)
-            .file_path(format!("{}/deletes/0001.parquet", table.metadata().location()))
+            .file_path(format!(
+                "{}/deletes/0001.parquet",
+                table.metadata().location()
+            ))
             .file_format(DataFileFormat::Parquet)
             .file_size_in_bytes(64)
             .record_count(1)
@@ -585,10 +585,7 @@ mod tests {
             .metadata()
             .current_snapshot()
             .expect("commit must produce a snapshot");
-        let manifest_list = table.manifest_list_reader(snap)
-            .load()
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snap).load().await.unwrap();
 
         // Two manifests — one Data, one Deletes.
         assert_eq!(manifest_list.entries().len(), 2);
@@ -598,7 +595,10 @@ mod tests {
             ManifestContentType::Data => 0,
             ManifestContentType::Deletes => 1,
         });
-        assert_eq!(content_types, vec![ManifestContentType::Data, ManifestContentType::Deletes]);
+        assert_eq!(content_types, vec![
+            ManifestContentType::Data,
+            ManifestContentType::Deletes
+        ]);
 
         // Walk each manifest and confirm the right file landed in the right
         // bucket.

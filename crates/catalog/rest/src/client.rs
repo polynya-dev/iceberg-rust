@@ -48,13 +48,10 @@ impl SigV4Signer {
         }
     }
 
-    async fn provider(
-        &self,
-    ) -> Result<&aws_credential_types::provider::SharedCredentialsProvider> {
+    async fn provider(&self) -> Result<&aws_credential_types::provider::SharedCredentialsProvider> {
         self.provider
             .get_or_try_init(|| async {
-                let cfg =
-                    aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
                 cfg.credentials_provider().ok_or_else(|| {
                     Error::new(
                         ErrorKind::Unexpected,
@@ -72,7 +69,7 @@ impl SigV4Signer {
     async fn sign(&self, request: &mut Request) -> Result<()> {
         use aws_credential_types::provider::ProvideCredentials;
         use aws_sigv4::http_request::{
-            sign, PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings,
+            PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
         };
         use aws_sigv4::sign::v4;
 
@@ -97,9 +94,7 @@ impl SigV4Signer {
             .time(std::time::SystemTime::now())
             .settings(settings)
             .build()
-            .map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "build SigV4 params").with_source(e)
-            })?
+            .map_err(|e| Error::new(ErrorKind::Unexpected, "build SigV4 params").with_source(e))?
             .into();
 
         let body_bytes = request
@@ -121,9 +116,7 @@ impl SigV4Signer {
             headers.iter().map(|(k, v)| (k.as_str(), v.as_str())),
             SignableBody::Bytes(&body_bytes),
         )
-        .map_err(|e| {
-            Error::new(ErrorKind::Unexpected, "build signable request").with_source(e)
-        })?;
+        .map_err(|e| Error::new(ErrorKind::Unexpected, "build signable request").with_source(e))?;
 
         let (instructions, _signature) = sign(signable, &params)
             .map_err(|e| Error::new(ErrorKind::Unexpected, "SigV4 sign").with_source(e))?

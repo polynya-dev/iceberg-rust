@@ -290,12 +290,12 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::{Catalog, CatalogBuilder, ErrorKind};
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, ManifestContentType, NestedField,
         Operation, PrimitiveType, Schema, Struct, Type,
     };
     use crate::transaction::{ApplyTransactionAction, Transaction};
+    use crate::{Catalog, CatalogBuilder, ErrorKind};
 
     async fn make_memory_table() -> (crate::memory::MemoryCatalog, crate::table::Table) {
         let schema = Schema::builder()
@@ -377,10 +377,7 @@ mod tests {
         let snap = table.metadata().current_snapshot().unwrap();
         assert_eq!(snap.summary().operation, Operation::Replace);
 
-        let mlist = table.manifest_list_reader(snap)
-            .load()
-            .await
-            .unwrap();
+        let mlist = table.manifest_list_reader(snap).load().await.unwrap();
         let data_manifests: Vec<_> = mlist
             .entries()
             .iter()
@@ -436,10 +433,7 @@ mod tests {
         let snap = table.metadata().current_snapshot().unwrap();
         assert_eq!(snap.summary().operation, Operation::Replace);
 
-        let mlist = table.manifest_list_reader(snap)
-            .load()
-            .await
-            .unwrap();
+        let mlist = table.manifest_list_reader(snap).load().await.unwrap();
         let data_manifests: Vec<_> = mlist
             .entries()
             .iter()
@@ -481,8 +475,16 @@ mod tests {
     async fn rewrite_carries_forward_unaffected_delete_manifest() {
         let (catalog, table) = make_memory_table().await;
 
-        let d1 = data_file("memory:///warehouse/public/orders/data/d1.parquet", 10, 1024);
-        let d2 = data_file("memory:///warehouse/public/orders/data/d2.parquet", 20, 2048);
+        let d1 = data_file(
+            "memory:///warehouse/public/orders/data/d1.parquet",
+            10,
+            1024,
+        );
+        let d2 = data_file(
+            "memory:///warehouse/public/orders/data/d2.parquet",
+            20,
+            2048,
+        );
         let eq_delete = DataFileBuilder::default()
             .content(DataContentType::EqualityDeletes)
             .file_path("memory:///warehouse/public/orders/deletes/eq.parquet".to_string())
@@ -518,10 +520,7 @@ mod tests {
         let table = tx.commit(&catalog).await.unwrap();
 
         let snap = table.metadata().current_snapshot().unwrap();
-        let mlist = table.manifest_list_reader(snap)
-            .load()
-            .await
-            .unwrap();
+        let mlist = table.manifest_list_reader(snap).load().await.unwrap();
 
         // Counts: 2 data manifests (rewritten survivors + new added) and
         // 1 delete manifest (unchanged carry-forward).
@@ -580,10 +579,7 @@ mod tests {
         let snap = table.metadata().current_snapshot().unwrap();
         assert_eq!(snap.summary().operation, Operation::Replace);
 
-        let mlist = table.manifest_list_reader(snap)
-            .load()
-            .await
-            .unwrap();
+        let mlist = table.manifest_list_reader(snap).load().await.unwrap();
         let data_manifest_count = mlist
             .entries()
             .iter()
@@ -647,10 +643,7 @@ mod tests {
 
         let snap = table.metadata().current_snapshot().unwrap();
         assert_eq!(snap.sequence_number(), 3);
-        let mlist = table.manifest_list_reader(snap)
-            .load()
-            .await
-            .unwrap();
+        let mlist = table.manifest_list_reader(snap).load().await.unwrap();
         let mut seqs = Vec::new();
         for mf in mlist.entries() {
             let m = mf.load_manifest(table.file_io()).await.unwrap();
@@ -701,10 +694,7 @@ mod tests {
 
         let table = catalog.load_table(table.identifier()).await.unwrap();
         let snap = table.metadata().current_snapshot().unwrap();
-        let mlist = table.manifest_list_reader(snap)
-            .load()
-            .await
-            .unwrap();
+        let mlist = table.manifest_list_reader(snap).load().await.unwrap();
         let mut paths = Vec::new();
         for mf in mlist.entries() {
             let m = mf.load_manifest(table.file_io()).await.unwrap();
@@ -796,5 +786,4 @@ mod tests {
         assert_eq!(summary(&table, "total-delete-files"), "0");
         assert_eq!(summary(&table, "total-equality-deletes"), "0");
     }
-
 }
