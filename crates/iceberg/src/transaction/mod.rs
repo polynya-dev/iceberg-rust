@@ -53,6 +53,7 @@
 mod action;
 
 pub use action::*;
+pub use snapshot::StagedSnapshot;
 mod append;
 mod expire_snapshots;
 mod replace_schema;
