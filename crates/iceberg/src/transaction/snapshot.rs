@@ -341,7 +341,7 @@ impl<'a> SnapshotProducer<'a> {
     /// Write a fresh manifest containing `survivors` as `Existing` entries.
     /// Used by replace/rewrite operations that drop some files from a prior
     /// manifest while preserving the rest. Each survivor must carry its
-    /// original `snapshot_id` and `sequence_number` (load_manifest's inherit
+    /// original `snapshot_id` and `sequence_number` (the manifest reader's inherit
     /// pass populates these from the manifest list entry, so feeding raw
     /// `manifest.entries()` here is safe).
     pub(crate) async fn write_existing_manifest_for(
