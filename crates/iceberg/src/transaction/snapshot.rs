@@ -386,6 +386,19 @@ impl<'a> SnapshotProducer<'a> {
         content: ManifestContentType,
         data_sequence_number: Option<i64>,
     ) -> Result<ManifestFile> {
+        self.added_manifest_writer(added_files, content, data_sequence_number)?
+            .write_manifest_file()
+            .await
+    }
+
+    /// A writer holding the manifest for a batch of added files, not yet
+    /// written.
+    fn added_manifest_writer(
+        &mut self,
+        added_files: Vec<DataFile>,
+        content: ManifestContentType,
+        data_sequence_number: Option<i64>,
+    ) -> Result<ManifestWriter> {
         if added_files.is_empty() {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
@@ -411,7 +424,7 @@ impl<'a> SnapshotProducer<'a> {
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }
-        writer.write_manifest_file().await
+        Ok(writer)
     }
 
     async fn manifest_file<OP: SnapshotProduceOperation, MP: ManifestProcess>(
@@ -549,34 +562,8 @@ impl<'a> SnapshotProducer<'a> {
         process: MP,
     ) -> Result<ActionCommit> {
         let manifest_list_path = self.generate_manifest_list_file_path(0);
-        let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
-        let writer = self
-            .table
-            .file_io()
-            .new_output(manifest_list_path.clone())?
-            .writer()
-            .await?;
-        let mut manifest_list_writer = match self.table.metadata().format_version() {
-            FormatVersion::V1 => ManifestListWriter::v1(
-                writer,
-                self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
-            ),
-            FormatVersion::V2 => ManifestListWriter::v2(
-                writer,
-                self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
-                next_seq_num,
-            ),
-            FormatVersion::V3 => ManifestListWriter::v3(
-                writer,
-                self.snapshot_id,
-                self.table.metadata().current_snapshot_id(),
-                next_seq_num,
-                Some(first_row_id),
-            ),
-        };
+        let mut manifest_list_writer = self.manifest_list_writer(&manifest_list_path).await?;
 
         // Calling self.summary() before self.manifest_file() is important because the
         // added_*_files vecs are drained by self.manifest_file(), which would result in
@@ -593,23 +580,123 @@ impl<'a> SnapshotProducer<'a> {
         let writer_next_row_id = manifest_list_writer.next_row_id();
         manifest_list_writer.close().await?;
 
+        let row_range = writer_next_row_id.map(|writer_next_row_id| {
+            let assigned_rows = writer_next_row_id - self.table.metadata().next_row_id();
+            (first_row_id, assigned_rows)
+        });
+        Ok(self.snapshot_commit(manifest_list_path, summary, row_range))
+    }
+
+    /// Plan this snapshot without writing it: the [`ActionCommit`] that adds
+    /// it, and its files to write ([`StagedSnapshot`]). Its manifest list
+    /// carries the manifests the caller names when it writes it, rather
+    /// than reading the parent's: snapshots one commit chains can be
+    /// written together. V1 and v2 tables only — v3's row lineage takes
+    /// its range from the written manifest list.
+    pub(crate) async fn stage<OP: SnapshotProduceOperation>(
+        mut self,
+        snapshot_produce_operation: &OP,
+    ) -> Result<(ActionCommit, StagedSnapshot)> {
+        if self.table.metadata().format_version() == FormatVersion::V3 {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "staged snapshots don't support format version 3",
+            ));
+        }
+        if self.added_data_files.is_empty()
+            && self.added_delete_files.is_empty()
+            && self.snapshot_properties.is_empty()
+        {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No added files or snapshot properties found when writing a manifest file",
+            ));
+        }
+        let manifest_list_path = self.generate_manifest_list_file_path(0);
+        let list = self.manifest_list_writer(&manifest_list_path).await?;
+        // Before the added files are taken below.
+        let summary = self.summary(snapshot_produce_operation).map_err(|err| {
+            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
+        })?;
+        let mut manifests = Vec::new();
+        if !self.added_data_files.is_empty() {
+            let added_data_files = std::mem::take(&mut self.added_data_files);
+            let seq = self.added_data_sequence_number;
+            manifests.push(self.added_manifest_writer(
+                added_data_files,
+                ManifestContentType::Data,
+                seq,
+            )?);
+        }
+        if !self.added_delete_files.is_empty() {
+            let added_delete_files = std::mem::take(&mut self.added_delete_files);
+            manifests.push(self.added_manifest_writer(
+                added_delete_files,
+                ManifestContentType::Deletes,
+                None,
+            )?);
+        }
+        let staged = StagedSnapshot {
+            manifests,
+            list,
+            sequence_number: self.table.metadata().next_sequence_number(),
+            format_version: self.table.metadata().format_version(),
+        };
+        Ok((
+            self.snapshot_commit(manifest_list_path, summary, None),
+            staged,
+        ))
+    }
+
+    /// A writer for this snapshot's manifest list at `path`.
+    async fn manifest_list_writer(&self, path: &str) -> Result<ManifestListWriter> {
+        let next_seq_num = self.table.metadata().next_sequence_number();
+        let writer = self.table.file_io().new_output(path)?.writer().await?;
+        Ok(match self.table.metadata().format_version() {
+            FormatVersion::V1 => ManifestListWriter::v1(
+                writer,
+                self.snapshot_id,
+                self.table.metadata().current_snapshot_id(),
+            ),
+            FormatVersion::V2 => ManifestListWriter::v2(
+                writer,
+                self.snapshot_id,
+                self.table.metadata().current_snapshot_id(),
+                next_seq_num,
+            ),
+            FormatVersion::V3 => ManifestListWriter::v3(
+                writer,
+                self.snapshot_id,
+                self.table.metadata().current_snapshot_id(),
+                next_seq_num,
+                Some(self.table.metadata().next_row_id()),
+            ),
+        })
+    }
+
+    /// The commit adding this snapshot, its manifest list at
+    /// `manifest_list_path`, and making it the main branch's.
+    fn snapshot_commit(
+        &self,
+        manifest_list_path: String,
+        summary: Summary,
+        row_range: Option<(u64, u64)>,
+    ) -> ActionCommit {
         let commit_ts = chrono::Utc::now().timestamp_millis();
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(manifest_list_path)
             .with_snapshot_id(self.snapshot_id)
             .with_parent_snapshot_id(self.table.metadata().current_snapshot_id())
-            .with_sequence_number(next_seq_num)
+            .with_sequence_number(self.table.metadata().next_sequence_number())
             .with_summary(summary)
             .with_schema_id(self.table.metadata().current_schema_id())
             .with_timestamp_ms(commit_ts);
 
-        let new_snapshot = if let Some(writer_next_row_id) = writer_next_row_id {
-            let assigned_rows = writer_next_row_id - self.table.metadata().next_row_id();
-            new_snapshot
+        let new_snapshot = match row_range {
+            Some((first_row_id, assigned_rows)) => new_snapshot
                 .with_row_range(first_row_id, assigned_rows)
-                .build()
-        } else {
-            new_snapshot.build()
+                .build(),
+            None => new_snapshot.build(),
         };
 
         let updates = vec![
@@ -635,6 +722,53 @@ impl<'a> SnapshotProducer<'a> {
             },
         ];
 
-        Ok(ActionCommit::new(updates, requirements))
+        ActionCommit::new(updates, requirements)
+    }
+}
+
+/// A snapshot planned but not written ([`crate::transaction::FastAppendAction::stage`]):
+/// its own manifests, written by [`Self::write_manifests`], then its
+/// manifest list, by [`Self::write_manifest_list`]. Each is a round trip to
+/// the object store; snapshots one commit chains can be written together,
+/// their manifests first, then their lists.
+pub struct StagedSnapshot {
+    manifests: Vec<ManifestWriter>,
+    list: ManifestListWriter,
+    sequence_number: i64,
+    format_version: FormatVersion,
+}
+
+impl StagedSnapshot {
+    /// Write the snapshot's own manifests, together. Returns them as its
+    /// manifest list records them — with its sequence number — so a later
+    /// snapshot's list can carry them.
+    pub async fn write_manifests(&mut self) -> Result<Vec<ManifestFile>> {
+        let written = std::mem::take(&mut self.manifests)
+            .into_iter()
+            .map(|writer| writer.write_manifest_file())
+            .collect::<futures::stream::FuturesOrdered<_>>()
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(written
+            .into_iter()
+            .map(|mut manifest| {
+                if self.format_version != FormatVersion::V1 {
+                    if manifest.sequence_number == crate::spec::UNASSIGNED_SEQUENCE_NUMBER {
+                        manifest.sequence_number = self.sequence_number;
+                    }
+                    if manifest.min_sequence_number == crate::spec::UNASSIGNED_SEQUENCE_NUMBER {
+                        manifest.min_sequence_number = self.sequence_number;
+                    }
+                }
+                manifest
+            })
+            .collect())
+    }
+
+    /// Write the snapshot's manifest list, naming `manifests`: the ones it
+    /// carries from its parent, then its own.
+    pub async fn write_manifest_list(mut self, manifests: Vec<ManifestFile>) -> Result<()> {
+        self.list.add_manifests(manifests.into_iter())?;
+        self.list.close().await
     }
 }
