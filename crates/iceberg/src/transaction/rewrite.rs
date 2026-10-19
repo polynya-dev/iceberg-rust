@@ -19,10 +19,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 
 use crate::error::{Error, ErrorKind, Result};
-use crate::spec::{DataContentType, DataFile, ManifestEntry, ManifestFile, Operation};
+use crate::spec::{DataContentType, DataFile, Manifest, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
@@ -128,7 +129,10 @@ impl RewriteFilesAction {
 #[async_trait]
 impl TransactionAction for RewriteFilesAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
-        let removed_files = self.removed_files(table).await?;
+        // One read of the table this attempt would land on serves both
+        // what the rewrite removes and which manifests it keeps.
+        let manifests = current_manifests(table).await?;
+        let removed_files = self.removed_files(&manifests)?;
         let snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
@@ -146,6 +150,7 @@ impl TransactionAction for RewriteFilesAction {
             .commit(
                 RewriteFilesOperation {
                     removed_paths: self.removed_paths.clone(),
+                    manifests,
                 },
                 DefaultManifestProcess,
             )
@@ -153,24 +158,49 @@ impl TransactionAction for RewriteFilesAction {
     }
 }
 
+/// Most manifests a rewrite reads at once.
+const MANIFEST_READ_CONCURRENCY: usize = 16;
+
+/// `table`'s current manifests, each with its manifest-list entry, in the
+/// manifest list's order: read [`MANIFEST_READ_CONCURRENCY`] at a time, as
+/// each is a round trip to the object store.
+async fn current_manifests(table: &Table) -> Result<Vec<(ManifestFile, Manifest)>> {
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Ok(Vec::new());
+    };
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+    let entries: Vec<ManifestFile> = manifest_list.consume_entries().into_iter().collect();
+    let runtime = table.runtime();
+    let file_io = table.file_io();
+    futures::stream::iter(entries)
+        .map(|entry| {
+            let file_io = file_io.clone();
+            runtime.io().spawn(async move {
+                let manifest = entry.load_manifest(&file_io).await?;
+                Ok::<_, Error>((entry, manifest))
+            })
+        })
+        .buffered(MANIFEST_READ_CONCURRENCY)
+        // The task's own result, inside its join's.
+        .and_then(futures::future::ready)
+        .try_collect()
+        .await
+}
+
 impl RewriteFilesAction {
-    /// The live files of `table` that `removed_paths` names — the snapshot
-    /// summary subtracts them. Fails if one isn't live: another rewrite
-    /// replaced it first, and committing this one's files as well would
-    /// duplicate their rows. Runs on every commit attempt, against the
-    /// table the commit would land on.
-    async fn removed_files(&self, table: &Table) -> Result<Vec<DataFile>> {
+    /// The live files in `manifests` that `removed_paths` names — the
+    /// snapshot summary subtracts them. Fails if one isn't live: another
+    /// rewrite replaced it first, and committing this one's files as well
+    /// would duplicate their rows. Runs on every commit attempt, against
+    /// the manifests of the table the commit would land on.
+    fn removed_files(&self, manifests: &[(ManifestFile, Manifest)]) -> Result<Vec<DataFile>> {
         let mut removed = Vec::new();
         let mut found: HashSet<&str> = HashSet::new();
-        if let Some(snapshot) = table.metadata().current_snapshot() {
-            let manifest_list = table.manifest_list_reader(snapshot).load().await?;
-            for mfile in manifest_list.entries() {
-                let manifest = mfile.load_manifest(table.file_io()).await?;
-                for entry in manifest.entries().iter().filter(|e| e.is_alive()) {
-                    if let Some(path) = self.removed_paths.get(entry.data_file().file_path()) {
-                        found.insert(path);
-                        removed.push(entry.data_file().clone());
-                    }
+        for (_, manifest) in manifests {
+            for entry in manifest.entries().iter().filter(|e| e.is_alive()) {
+                if let Some(path) = self.removed_paths.get(entry.data_file().file_path()) {
+                    found.insert(path);
+                    removed.push(entry.data_file().clone());
                 }
             }
         }
@@ -193,6 +223,8 @@ impl RewriteFilesAction {
 
 struct RewriteFilesOperation {
     removed_paths: HashSet<String>,
+    /// The current snapshot's manifests, as the commit read them.
+    manifests: Vec<(ManifestFile, Manifest)>,
 }
 
 impl SnapshotProduceOperation for RewriteFilesOperation {
@@ -216,16 +248,6 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         &self,
         snapshot_produce: &mut SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
-        let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
-            return Ok(vec![]);
-        };
-
-        let manifest_list = snapshot_produce
-            .table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await?;
-
         // Walk each prior manifest, decide carry-forward vs. partial-rewrite
         // vs. drop.
         //
@@ -233,8 +255,6 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         // can't write rewritten manifests yet because that needs `&mut
         // snapshot_produce`, and we also need the producer to compute
         // file-IO paths during this loop.
-        let manifest_list_entries = manifest_list.entries().to_vec();
-        let file_io = snapshot_produce.table.file_io().clone();
 
         enum Plan {
             CarryForward(ManifestFile),
@@ -244,9 +264,8 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
                 content: crate::spec::ManifestContentType,
             },
         }
-        let mut plans: Vec<Plan> = Vec::with_capacity(manifest_list_entries.len());
-        for mfile in &manifest_list_entries {
-            let manifest = mfile.load_manifest(&file_io).await?;
+        let mut plans: Vec<Plan> = Vec::with_capacity(self.manifests.len());
+        for (mfile, manifest) in &self.manifests {
             let total = manifest.entries().len();
             let survivors: Vec<ManifestEntry> = manifest
                 .entries()
