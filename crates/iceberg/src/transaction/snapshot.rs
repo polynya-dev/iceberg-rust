@@ -605,20 +605,16 @@ impl<'a> SnapshotProducer<'a> {
     /// it, and its files to write ([`StagedSnapshot`]). Its manifest list
     /// carries the manifests the caller names when it writes it, rather
     /// than reading the parent's: snapshots one commit chains can be
-    /// written together. V1 and v2 tables only — v3's row lineage takes
-    /// its range from the written manifest list — and unencrypted tables
-    /// only: an encrypted list's key, which the snapshot names, is only
-    /// known once the list is written.
+    /// written together. On a v3 table, its rows take the row ids after the
+    /// table's last, which its data manifest records as it's written: every
+    /// manifest its list carries must have its ids already (see
+    /// [`StagedSnapshot::write_manifest_list`]). Unencrypted tables only:
+    /// an encrypted list's key, which the snapshot names, is only known
+    /// once the list is written.
     pub(crate) async fn stage<OP: SnapshotProduceOperation>(
         mut self,
         snapshot_produce_operation: &OP,
     ) -> Result<(ActionCommit, StagedSnapshot)> {
-        if self.table.metadata().format_version() == FormatVersion::V3 {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "staged snapshots don't support format version 3",
-            ));
-        }
         if self.table.encryption_manager().is_some() {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
@@ -636,6 +632,11 @@ impl<'a> SnapshotProducer<'a> {
         }
         let manifest_list_path = self.generate_manifest_list_file_path(0)?;
         let (list, _) = self.manifest_list_writer(&manifest_list_path).await?;
+        // v3: the rows it adds take the row ids after the table's last.
+        let row_range = (self.table.metadata().format_version() == FormatVersion::V3).then(|| {
+            let added_rows = self.added_data_files.iter().map(|f| f.record_count()).sum();
+            (self.table.metadata().next_row_id(), added_rows)
+        });
         // Before the added files are taken below.
         let summary = self.summary(snapshot_produce_operation).map_err(|err| {
             Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
@@ -663,9 +664,10 @@ impl<'a> SnapshotProducer<'a> {
             list,
             sequence_number: self.table.metadata().next_sequence_number(),
             format_version: self.table.metadata().format_version(),
+            first_row_id: row_range.map(|(first_row_id, _)| first_row_id),
         };
         Ok((
-            self.snapshot_commit(manifest_list_path, summary, None, None),
+            self.snapshot_commit(manifest_list_path, summary, row_range, None),
             staged,
         ))
     }
@@ -799,12 +801,15 @@ pub struct StagedSnapshot {
     list: ManifestListWriter,
     sequence_number: i64,
     format_version: FormatVersion,
+    /// v3: the first row id of the rows it adds.
+    first_row_id: Option<u64>,
 }
 
 impl StagedSnapshot {
     /// Write the snapshot's own manifests, together. Returns them as its
-    /// manifest list records them — with its sequence number — so a later
-    /// snapshot's list can carry them.
+    /// manifest list records them — with its sequence number and, on a v3
+    /// table, the first row id of its rows — so a later snapshot's list
+    /// can carry them.
     pub async fn write_manifests(&mut self) -> Result<Vec<ManifestFile>> {
         let written = std::mem::take(&mut self.manifests)
             .into_iter()
@@ -823,6 +828,10 @@ impl StagedSnapshot {
                         manifest.min_sequence_number = self.sequence_number;
                     }
                 }
+                // Its one data manifest holds all the rows it adds.
+                if manifest.content == ManifestContentType::Data {
+                    manifest.first_row_id = self.first_row_id;
+                }
                 manifest
             })
             .collect())
@@ -830,8 +839,21 @@ impl StagedSnapshot {
 
     /// Write the snapshot's manifest list, naming `manifests`: the ones it
     /// carries from its parent, then its own.
+    ///
+    /// On a v3 table, every data manifest it names must have its row ids:
+    /// its own takes them when it's written ([`Self::write_manifests`]),
+    /// its parent's had them from their own lists. One that didn't — a
+    /// table's files from before it was upgraded to v3 — would take ids its
+    /// snapshot's row range doesn't count: the snapshot has to be committed
+    /// on its own, its list assigning them.
     pub async fn write_manifest_list(mut self, manifests: Vec<ManifestFile>) -> Result<()> {
         self.list.add_manifests(manifests.into_iter())?;
+        if self.list.next_row_id() != self.first_row_id {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "a staged snapshot carries a data manifest without row ids; commit it on its own",
+            ));
+        }
         self.list.close().await.map(drop)
     }
 }
