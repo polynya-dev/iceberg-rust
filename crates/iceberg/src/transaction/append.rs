@@ -25,17 +25,24 @@ use crate::error::Result;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
 use crate::transaction::snapshot::{
-    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
+    DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer, StagedSnapshot,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
-/// FastAppendAction is a transaction action for fast append data files to the table.
+/// FastAppendAction is a transaction action that appends data files and/or
+/// equality-/position-delete files to the table in a single snapshot.
+///
+/// Files passed via [`Self::add_data_files`] are routed by `content_type()`
+/// into separate manifests at commit time — `Data` files into a data
+/// manifest, `EqualityDeletes`/`PositionDeletes` into a delete manifest. The
+/// Iceberg spec forbids mixing content types in one manifest.
 pub struct FastAppendAction {
     check_duplicate: bool,
     // below are properties used to create SnapshotProducer when commit
     commit_uuid: Option<Uuid>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    added_delete_files: Vec<DataFile>,
 }
 
 impl FastAppendAction {
@@ -45,6 +52,7 @@ impl FastAppendAction {
             commit_uuid: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
+            added_delete_files: vec![],
         }
     }
 
@@ -54,9 +62,19 @@ impl FastAppendAction {
         self
     }
 
-    /// Add data files to the snapshot.
+    /// Add files to the snapshot. Files are routed by `content_type()`
+    /// into the data manifest (for `Data`) or the delete manifest (for
+    /// `EqualityDeletes` / `PositionDeletes`).
     pub fn add_data_files(mut self, data_files: impl IntoIterator<Item = DataFile>) -> Self {
-        self.added_data_files.extend(data_files);
+        for file in data_files {
+            match file.content_type() {
+                crate::spec::DataContentType::Data => self.added_data_files.push(file),
+                crate::spec::DataContentType::EqualityDeletes
+                | crate::spec::DataContentType::PositionDeletes => {
+                    self.added_delete_files.push(file)
+                }
+            }
+        }
         self
     }
 
@@ -75,13 +93,34 @@ impl FastAppendAction {
     /// Collapse files sharing a path to their first occurrence, so a single
     /// manifest never references the same file twice. Always runs (unlike the
     /// `check_duplicate`-gated cross-snapshot check) since it is in-memory only.
-    fn dedupe_added_files(&self) -> Vec<DataFile> {
-        let mut seen = HashSet::with_capacity(self.added_data_files.len());
-        self.added_data_files
+    fn dedupe_added_files(files: &[DataFile]) -> Vec<DataFile> {
+        let mut seen = HashSet::with_capacity(files.len());
+        files
             .iter()
             .filter(|data_file| seen.insert(data_file.file_path.as_str()))
             .cloned()
             .collect()
+    }
+}
+
+impl FastAppendAction {
+    /// Plan this append's snapshot against `table` without writing it: the
+    /// commit that adds it, and its files to write. For a chain of appends
+    /// one commit lands, whose files are then written together — their
+    /// manifests, then their manifest lists, each naming its parent's
+    /// manifests and its own. Doesn't check for duplicate files. V1 and v2
+    /// tables only.
+    pub async fn stage(&self, table: &Table) -> Result<(ActionCommit, StagedSnapshot)> {
+        let snapshot_producer = SnapshotProducer::new(
+            table,
+            self.commit_uuid.unwrap_or_else(Uuid::now_v7),
+            self.snapshot_properties.clone(),
+            self.added_data_files.clone(),
+            self.added_delete_files.clone(),
+        );
+        snapshot_producer.validate_added_files(&self.added_data_files)?;
+        snapshot_producer.validate_added_files(&self.added_delete_files)?;
+        snapshot_producer.stage(&FastAppendOperation).await
     }
 }
 
@@ -92,11 +131,13 @@ impl TransactionAction for FastAppendAction {
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             self.snapshot_properties.clone(),
-            self.dedupe_added_files(),
+            Self::dedupe_added_files(&self.added_data_files),
+            Self::dedupe_added_files(&self.added_delete_files),
         );
 
-        // validate added files
-        snapshot_producer.validate_added_data_files()?;
+        // Both vecs follow the same partition-spec / partition-value rules.
+        snapshot_producer.validate_added_files(&self.added_data_files)?;
+        snapshot_producer.validate_added_files(&self.added_delete_files)?;
 
         // Checks duplicate files
         if self.check_duplicate {
@@ -125,7 +166,7 @@ impl SnapshotProduceOperation for FastAppendOperation {
 
     async fn existing_manifest(
         &self,
-        snapshot_produce: &SnapshotProducer<'_>,
+        snapshot_produce: &mut SnapshotProducer<'_>,
     ) -> Result<Vec<ManifestFile>> {
         let Some(snapshot) = snapshot_produce.table.metadata().current_snapshot() else {
             return Ok(vec![]);
@@ -792,6 +833,298 @@ mod tests {
                 .unwrap(),
             "val"
         );
+    }
+
+    /// FastAppend now accepts mixed data + equality-delete files and routes
+    /// them into separate manifests at commit time. The Iceberg manifest list
+    /// should end up with two entries — one with `ManifestContentType::Data`,
+    /// one with `Deletes`.
+    #[tokio::test]
+    async fn test_fast_append_routes_equality_deletes_into_separate_manifest() {
+        use crate::spec::{ManifestContentType, NestedField, PrimitiveType, Schema, Type};
+
+        // Build a minimal in-memory table with FileIO::new_with_memory so the
+        // manifest writer can actually persist files.
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_identifier_field_ids([1])
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "qty", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        use crate::CatalogBuilder;
+        let memory: crate::memory::MemoryCatalog = crate::memory::MemoryCatalogBuilder::default()
+            .load(
+                "test",
+                HashMap::from([(
+                    crate::memory::MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    "memory:///warehouse".to_string(),
+                )]),
+            )
+            .await
+            .unwrap();
+        use crate::Catalog;
+        let ns = crate::NamespaceIdent::from_strs(["public"]).unwrap();
+        memory.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let creation = crate::TableCreation::builder()
+            .name("orders".to_string())
+            .schema(schema)
+            .build();
+        let table = memory.create_table(&ns, creation).await.unwrap();
+
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(format!("{}/data/0001.parquet", table.metadata().location()))
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(2048)
+            .record_count(7)
+            .partition(Struct::empty())
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .build()
+            .unwrap();
+
+        let delete_file = DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path(format!(
+                "{}/deletes/0001.parquet",
+                table.metadata().location()
+            ))
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(64)
+            .record_count(1)
+            .equality_ids(Some(vec![1]))
+            .partition(Struct::empty())
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .build()
+            .unwrap();
+
+        use crate::transaction::ApplyTransactionAction;
+        let tx = Transaction::new(&table);
+        let action = tx
+            .fast_append()
+            .with_check_duplicate(false)
+            .add_data_files(vec![data_file.clone(), delete_file.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&memory).await.unwrap();
+
+        let snap = table
+            .metadata()
+            .current_snapshot()
+            .expect("commit must produce a snapshot");
+        let manifest_list = table.manifest_list_reader(snap).load().await.unwrap();
+
+        // Two manifests — one Data, one Deletes.
+        assert_eq!(manifest_list.entries().len(), 2);
+        let mut content_types: Vec<ManifestContentType> =
+            manifest_list.entries().iter().map(|e| e.content).collect();
+        content_types.sort_by_key(|c| match c {
+            ManifestContentType::Data => 0,
+            ManifestContentType::Deletes => 1,
+        });
+        assert_eq!(content_types, vec![
+            ManifestContentType::Data,
+            ManifestContentType::Deletes
+        ]);
+
+        // Walk each manifest and confirm the right file landed in the right
+        // bucket.
+        for entry in manifest_list.entries() {
+            let manifest = table.manifest_reader().read(entry).await.unwrap();
+            assert_eq!(manifest.entries().len(), 1);
+            let me = &manifest.entries()[0];
+            match entry.content {
+                ManifestContentType::Data => {
+                    assert_eq!(me.data_file().content_type(), DataContentType::Data);
+                    assert_eq!(me.data_file().record_count(), 7);
+                }
+                ManifestContentType::Deletes => {
+                    assert_eq!(
+                        me.data_file().content_type(),
+                        DataContentType::EqualityDeletes
+                    );
+                    assert_eq!(me.data_file().equality_ids(), Some(vec![1]));
+                }
+            }
+        }
+    }
+
+    /// A fresh in-memory table, and its catalog.
+    async fn memory_table() -> (crate::memory::MemoryCatalog, Table) {
+        use crate::spec::{NestedField, PrimitiveType, Schema, Type};
+        use crate::{Catalog, CatalogBuilder};
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_identifier_field_ids([1])
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+        let memory: crate::memory::MemoryCatalog = crate::memory::MemoryCatalogBuilder::default()
+            .load(
+                "test",
+                HashMap::from([(
+                    crate::memory::MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    "memory:///warehouse".to_string(),
+                )]),
+            )
+            .await
+            .unwrap();
+        let ns = crate::NamespaceIdent::from_strs(["public"]).unwrap();
+        memory.create_namespace(&ns, HashMap::new()).await.unwrap();
+        let creation = crate::TableCreation::builder()
+            .name("orders".to_string())
+            .schema(schema)
+            .build();
+        let table = memory.create_table(&ns, creation).await.unwrap();
+        (memory, table)
+    }
+
+    /// Step `n`'s files: a data file, and an equality-delete file.
+    fn step_files(table: &Table, n: usize) -> Vec<DataFile> {
+        let file = |content, kind: &str| {
+            let mut builder = DataFileBuilder::default();
+            builder
+                .content(content)
+                .file_path(format!(
+                    "{}/{kind}/{n}.parquet",
+                    table.metadata().location()
+                ))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(n as u64 + 1)
+                .partition(Struct::empty())
+                .partition_spec_id(table.metadata().default_partition_spec_id());
+            if content == DataContentType::EqualityDeletes {
+                builder.equality_ids(Some(vec![1]));
+            }
+            builder.build().unwrap()
+        };
+        vec![
+            file(DataContentType::Data, "data"),
+            file(DataContentType::EqualityDeletes, "deletes"),
+        ]
+    }
+
+    /// Each snapshot as its manifest list has it: per manifest, its content,
+    /// sequence numbers and the files it holds, with their sequence numbers.
+    async fn snapshots_as_listed(table: &Table) -> Vec<(i64, Vec<String>)> {
+        let mut out = Vec::new();
+        for snapshot in table.metadata().snapshots() {
+            let list = table.manifest_list_reader(snapshot).load().await.unwrap();
+            let mut manifests = Vec::new();
+            for m in list.entries() {
+                let manifest = table.manifest_reader().read(m).await.unwrap();
+                let files: Vec<_> = manifest
+                    .entries()
+                    .iter()
+                    .map(|e| (e.file_path().to_string(), e.sequence_number()))
+                    .collect();
+                manifests.push(format!(
+                    "{:?} seq {} min {} {:?}",
+                    m.content, m.sequence_number, m.min_sequence_number, files
+                ));
+            }
+            manifests.sort();
+            out.push((snapshot.sequence_number(), manifests));
+        }
+        out.sort();
+        out
+    }
+
+    /// A chain of appends staged and written together — every snapshot's
+    /// manifests at once, then every manifest list, each naming its
+    /// parent's manifests and its own — lands as the same table as the
+    /// appends committed one after another.
+    #[tokio::test]
+    async fn a_staged_chain_of_appends_lands_as_appends_one_by_one() {
+        use crate::transaction::ApplyTransactionAction;
+        use crate::{Catalog, TableCommit};
+        const STEPS: usize = 3;
+
+        let (one_by_one_catalog, mut one_by_one) = memory_table().await;
+        for n in 0..STEPS {
+            let tx = Transaction::new(&one_by_one);
+            let files = step_files(&one_by_one, n);
+            let tx = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(files)
+                .apply(tx)
+                .unwrap();
+            one_by_one = tx.commit(&one_by_one_catalog).await.unwrap();
+        }
+
+        let (staged_catalog, table) = memory_table().await;
+        let mut local = table.clone();
+        let mut updates = Vec::new();
+        let mut requirements = Vec::new();
+        let mut staged = Vec::new();
+        for n in 0..STEPS {
+            let files = step_files(&local, n);
+            let (commit, snapshot) = Transaction::new(&local)
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(files)
+                .stage(&local)
+                .await
+                .unwrap();
+            // The table as the commit finds it: the first step's.
+            let mut later = Vec::new();
+            let step_requirements = if n == 0 {
+                &mut requirements
+            } else {
+                &mut later
+            };
+            local = Transaction::apply(local, commit, &mut updates, step_requirements).unwrap();
+            staged.push(snapshot);
+        }
+        let added = futures::future::try_join_all(staged.iter_mut().map(|s| s.write_manifests()))
+            .await
+            .unwrap();
+        let mut parent = Vec::new();
+        let mut lists = Vec::new();
+        for (snapshot, added) in staged.into_iter().zip(added) {
+            let manifests: Vec<crate::spec::ManifestFile> =
+                parent.into_iter().chain(added).collect();
+            parent = manifests.clone();
+            lists.push(snapshot.write_manifest_list(manifests));
+        }
+        futures::future::try_join_all(lists).await.unwrap();
+        let staged_table = staged_catalog
+            .update_table(
+                TableCommit::builder()
+                    .ident(table.identifier().clone())
+                    .updates(updates)
+                    .requirements(requirements)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(staged_table.metadata().snapshots().count(), STEPS);
+        assert_eq!(
+            snapshots_as_listed(&staged_table).await,
+            snapshots_as_listed(&one_by_one).await
+        );
+        let summaries = |t: &Table| {
+            let mut s: Vec<_> = t
+                .metadata()
+                .snapshots()
+                .map(|s| {
+                    (
+                        s.sequence_number(),
+                        s.summary().additional_properties.clone(),
+                    )
+                })
+                .collect();
+            s.sort_by_key(|(seq, _)| *seq);
+            s
+        };
+        assert_eq!(summaries(&staged_table), summaries(&one_by_one));
     }
 
     #[tokio::test]

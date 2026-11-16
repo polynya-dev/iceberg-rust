@@ -53,8 +53,11 @@
 mod action;
 
 pub use action::*;
+pub use snapshot::StagedSnapshot;
 mod append;
 mod expire_snapshots;
+mod replace_schema;
+mod rewrite;
 mod snapshot;
 mod sort_order;
 mod update_location;
@@ -72,9 +75,10 @@ pub use update_schema::AddColumn;
 use crate::error::Result;
 use crate::spec::TableProperties;
 use crate::table::Table;
-use crate::transaction::action::BoxedTransactionAction;
 pub use crate::transaction::append::FastAppendAction;
 pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::replace_schema::ReplaceSchemaAction;
+pub use crate::transaction::rewrite::RewriteFilesAction;
 pub use crate::transaction::sort_order::ReplaceSortOrderAction;
 pub use crate::transaction::update_location::UpdateLocationAction;
 pub use crate::transaction::update_properties::UpdatePropertiesAction;
@@ -88,6 +92,9 @@ use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
 pub struct Transaction {
     table: Table,
     actions: Vec<BoxedTransactionAction>,
+    /// Whether `table` was loaded just before: the first attempt commits
+    /// on it rather than reloading it.
+    fresh_base: bool,
 }
 
 impl Transaction {
@@ -96,7 +103,19 @@ impl Transaction {
         Self {
             table: table.clone(),
             actions: vec![],
+            fresh_base: false,
         }
+    }
+
+    /// Declares the table this transaction was created with as current —
+    /// loaded just before — so its first commit attempt doesn't load it
+    /// again: a round trip to the catalog saved. If the table changed
+    /// meanwhile, that attempt fails with a conflict, and the retry
+    /// reloads it and applies the actions again, as every attempt does
+    /// otherwise.
+    pub fn with_fresh_base(mut self) -> Self {
+        self.fresh_base = true;
+        self
     }
 
     fn update_table_metadata(table: Table, updates: &[TableUpdate]) -> Result<Table> {
@@ -151,6 +170,13 @@ impl Transaction {
         FastAppendAction::new()
     }
 
+    /// Creates a `RewriteFilesAction` for compaction-style replace
+    /// operations: drops a set of existing files and adds new ones in one
+    /// `Operation::Replace` snapshot.
+    pub fn rewrite_files(&self) -> RewriteFilesAction {
+        RewriteFilesAction::new()
+    }
+
     /// Creates replace sort order action.
     pub fn replace_sort_order(&self) -> ReplaceSortOrderAction {
         ReplaceSortOrderAction::new()
@@ -169,6 +195,15 @@ impl Transaction {
     /// Expire snapshots from the table metadata.
     pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
         ExpireSnapshotsAction::new()
+    }
+
+    /// Replace the table's current schema with a new target schema.
+    ///
+    /// The caller is responsible for constructing a schema that's a valid
+    /// evolution of the current one — this action does not enforce
+    /// schema-evolution compatibility rules.
+    pub fn replace_schema(&self) -> ReplaceSchemaAction {
+        ReplaceSchemaAction::new()
     }
 
     /// Commit transaction.
@@ -208,13 +243,15 @@ impl Transaction {
     }
 
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
-        let refreshed = catalog.load_table(self.table.identifier()).await?;
+        if !std::mem::take(&mut self.fresh_base) {
+            let refreshed = catalog.load_table(self.table.identifier()).await?;
 
-        if self.table.metadata() != refreshed.metadata()
-            || self.table.metadata_location() != refreshed.metadata_location()
-        {
-            // current base is stale, use refreshed as base and re-apply transaction actions
-            self.table = refreshed.clone();
+            if self.table.metadata() != refreshed.metadata()
+                || self.table.metadata_location() != refreshed.metadata_location()
+            {
+                // current base is stale, use refreshed as base and re-apply transaction actions
+                self.table = refreshed.clone();
+            }
         }
 
         let mut current_table = self.table.clone();
@@ -456,6 +493,63 @@ mod tests {
             });
 
         mock_catalog
+    }
+
+    /// A mock catalog whose first `conflicts` commits fail with a
+    /// retryable conflict, and that expects `loads` table loads.
+    fn mock_catalog_counting_loads(conflicts: u32, loads: usize) -> MockCatalog {
+        let mut mock_catalog = MockCatalog::new();
+        mock_catalog
+            .expect_load_table()
+            .times(loads)
+            .returning_st(|_| Box::pin(async move { Ok(make_v2_table()) }));
+        let attempts = AtomicU32::new(0);
+        mock_catalog
+            .expect_update_table()
+            .times(conflicts as usize + 1)
+            .returning_st(move |_| {
+                if attempts.fetch_add(1, Ordering::SeqCst) < conflicts {
+                    Box::pin(async move {
+                        Err(
+                            Error::new(ErrorKind::CatalogCommitConflicts, "Commit conflict")
+                                .with_retryable(true),
+                        )
+                    })
+                } else {
+                    Box::pin(async move { Ok(make_v2_table()) })
+                }
+            });
+        mock_catalog
+    }
+
+    #[tokio::test]
+    async fn a_fresh_base_commits_without_reloading_the_table() {
+        let table = setup_test_table("3");
+        let tx = create_test_transaction(&table).with_fresh_base();
+
+        let mock_catalog = mock_catalog_counting_loads(0, 0);
+
+        assert!(tx.commit(&mock_catalog).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_fresh_base_reloads_the_table_to_retry_a_conflict() {
+        let table = setup_test_table("3");
+        let tx = create_test_transaction(&table).with_fresh_base();
+
+        let mock_catalog = mock_catalog_counting_loads(1, 1);
+
+        assert!(tx.commit(&mock_catalog).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn without_a_fresh_base_every_attempt_reloads_the_table() {
+        let table = setup_test_table("3");
+        let tx = create_test_transaction(&table);
+
+        let mock_catalog = mock_catalog_counting_loads(1, 2);
+
+        assert!(tx.commit(&mock_catalog).await.is_ok());
     }
 
     #[tokio::test]

@@ -81,9 +81,14 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
     /// - **Append operations**: Typically include all existing manifests
     /// - **Overwrite operations**: May exclude manifests for partitions being overwritten
     /// - **Delete operations**: May exclude manifests for partitions being deleted
+    ///
+    /// Takes `&mut SnapshotProducer` so implementations that rewrite
+    /// manifests in place (e.g. `Replace`) can call helpers like
+    /// `write_existing_manifest_for` here. Append-style implementations
+    /// that only need read access can ignore the mutability.
     fn existing_manifest(
         &self,
-        snapshot_produce: &SnapshotProducer<'_>,
+        snapshot_produce: &mut SnapshotProducer<'_>,
     ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
@@ -113,6 +118,16 @@ pub(crate) struct SnapshotProducer<'a> {
     commit_uuid: Uuid,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    /// Equality- and position-delete files added in this snapshot. Written
+    /// to a separate manifest from `added_data_files` because the Iceberg
+    /// spec forbids mixing data and delete entries in one manifest.
+    added_delete_files: Vec<DataFile>,
+    /// Data sequence number for `added_data_files`; `None` to inherit the
+    /// snapshot's.
+    added_data_sequence_number: Option<i64>,
+    /// Files this snapshot removes from the table, for its summary's
+    /// `deleted-*` counts and running `total-*`.
+    removed_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -125,6 +140,7 @@ impl<'a> SnapshotProducer<'a> {
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
+        added_delete_files: Vec<DataFile>,
     ) -> Self {
         Self {
             table,
@@ -132,18 +148,33 @@ impl<'a> SnapshotProducer<'a> {
             commit_uuid,
             snapshot_properties,
             added_data_files,
+            added_delete_files,
+            added_data_sequence_number: None,
+            removed_files: Vec::new(),
             manifest_counter: (0..),
         }
     }
 
-    pub(crate) fn validate_added_data_files(&self) -> Result<()> {
-        for data_file in &self.added_data_files {
-            if data_file.content_type() != crate::spec::DataContentType::Data {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Only data content type is allowed for fast append",
-                ));
-            }
+    /// Write the added data files with this data sequence number instead of
+    /// letting them inherit the snapshot's: their rows logically belong to
+    /// an older sequence number (see the spec's "Sequence Number
+    /// Inheritance"). Ignored for v1 tables, which have none.
+    pub(crate) fn with_added_data_sequence_number(mut self, seq: Option<i64>) -> Self {
+        self.added_data_sequence_number = seq;
+        self
+    }
+
+    /// Record files this snapshot removes, so its summary subtracts them.
+    pub(crate) fn with_removed_files(mut self, files: Vec<DataFile>) -> Self {
+        self.removed_files = files;
+        self
+    }
+
+    /// Validate partition spec / partition value compatibility for a slice of
+    /// added files. Generic over data vs. delete files — the Iceberg spec
+    /// validation rules are the same for both content types.
+    pub(crate) fn validate_added_files(&self, files: &[DataFile]) -> Result<()> {
+        for data_file in files {
             // Check if the data file partition spec id matches the table default partition spec id.
             if self.table.metadata().default_partition_spec_id() != data_file.partition_spec_id {
                 return Err(Error::new(
@@ -168,6 +199,7 @@ impl<'a> SnapshotProducer<'a> {
         let new_files: HashSet<&str> = self
             .added_data_files
             .iter()
+            .chain(self.added_delete_files.iter())
             .map(|df| df.file_path.as_str())
             .collect();
 
@@ -306,19 +338,80 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
-    // Write manifest file for added data files and return the ManifestFile for ManifestList.
-    async fn write_added_manifest(&mut self) -> Result<ManifestFile> {
-        let added_data_files = std::mem::take(&mut self.added_data_files);
-        if added_data_files.is_empty() {
+    /// Write a fresh manifest containing `survivors` as `Existing` entries.
+    /// Used by replace/rewrite operations that drop some files from a prior
+    /// manifest while preserving the rest. Each survivor must carry its
+    /// original `snapshot_id` and `sequence_number` (the manifest reader's inherit
+    /// pass populates these from the manifest list entry, so feeding raw
+    /// `manifest.entries()` here is safe).
+    pub(crate) async fn write_existing_manifest_for(
+        &mut self,
+        survivors: Vec<ManifestEntry>,
+        content: ManifestContentType,
+    ) -> Result<ManifestFile> {
+        if survivors.is_empty() {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files found when write an added manifest file",
+                "No survivor entries when rewriting an existing manifest",
+            ));
+        }
+        let mut writer = self.new_manifest_writer(content)?;
+        for entry in survivors {
+            let snapshot_id = entry.snapshot_id().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "manifest entry missing snapshot_id when rewriting as existing",
+                )
+            })?;
+            let sequence_number = entry.sequence_number().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "manifest entry missing sequence_number when rewriting as existing",
+                )
+            })?;
+            writer.add_existing_file(
+                entry.data_file().clone(),
+                snapshot_id,
+                sequence_number,
+                entry.file_sequence_number,
+            )?;
+        }
+        writer.write_manifest_file().await
+    }
+
+    /// Write a manifest file for a batch of added files, returning the
+    /// `ManifestFile` to splice into the manifest list. The caller picks the
+    /// content type — data and delete files must live in separate manifests
+    /// per the Iceberg spec.
+    async fn write_added_manifest_for(
+        &mut self,
+        added_files: Vec<DataFile>,
+        content: ManifestContentType,
+        data_sequence_number: Option<i64>,
+    ) -> Result<ManifestFile> {
+        self.added_manifest_writer(added_files, content, data_sequence_number)?
+            .write_manifest_file()
+            .await
+    }
+
+    /// A writer holding the manifest for a batch of added files, not yet
+    /// written.
+    fn added_manifest_writer(
+        &mut self,
+        added_files: Vec<DataFile>,
+        content: ManifestContentType,
+        data_sequence_number: Option<i64>,
+    ) -> Result<ManifestWriter> {
+        if added_files.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No added files found when writing a manifest file",
             ));
         }
 
         let snapshot_id = self.snapshot_id;
         let format_version = self.table.metadata().format_version();
-        let manifest_entries = added_data_files.into_iter().map(|data_file| {
+        let manifest_entries = added_files.into_iter().map(|data_file| {
             let builder = ManifestEntry::builder()
                 .status(crate::spec::ManifestStatus::Added)
                 .data_file(data_file);
@@ -327,14 +420,14 @@ impl<'a> SnapshotProducer<'a> {
             } else {
                 // For format version > 1, we set the snapshot id at the inherited time to avoid rewrite the manifest file when
                 // commit failed.
-                builder.build()
+                builder.sequence_number_opt(data_sequence_number).build()
             }
         });
-        let mut writer = self.new_manifest_writer(ManifestContentType::Data)?;
+        let mut writer = self.new_manifest_writer(content)?;
         for entry in manifest_entries {
             writer.add_entry(entry)?;
         }
-        writer.write_manifest_file().await
+        Ok(writer)
     }
 
     /// Creates new manifests for data files added or removed,
@@ -349,24 +442,43 @@ impl<'a> SnapshotProducer<'a> {
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
         // We should clean it up after all necessary actions are supported.
         // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
-        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+        if self.added_data_files.is_empty()
+            && self.added_delete_files.is_empty()
+            && self.snapshot_properties.is_empty()
+        {
             return Err(Error::new(
                 ErrorKind::PreconditionFailed,
-                "No added data files or added snapshot properties found when write a manifest file",
+                "No added files or snapshot properties found when writing a manifest file",
             ));
         }
 
+        // Existing-manifest selection runs first because Replace operations
+        // may write rewritten manifests via `&mut self` here; the added-file
+        // manifest write below comes after to keep ordering deterministic.
         let existing_manifests = snapshot_produce_operation.existing_manifest(self).await?;
         let mut manifest_files = existing_manifests;
 
-        // Process added entries.
+        // Data and delete files must go into separate manifests — Iceberg
+        // doesn't allow mixing content types in a single manifest.
         if !self.added_data_files.is_empty() {
-            let added_manifest = self.write_added_manifest().await?;
-            manifest_files.push(added_manifest);
+            let added_data_files = std::mem::take(&mut self.added_data_files);
+            let seq = self.added_data_sequence_number;
+            manifest_files.push(
+                self.write_added_manifest_for(added_data_files, ManifestContentType::Data, seq)
+                    .await?,
+            );
         }
-
-        // # TODO
-        // Support process delete entries.
+        if !self.added_delete_files.is_empty() {
+            let added_delete_files = std::mem::take(&mut self.added_delete_files);
+            manifest_files.push(
+                self.write_added_manifest_for(
+                    added_delete_files,
+                    ManifestContentType::Deletes,
+                    None,
+                )
+                .await?,
+            );
+        }
 
         let manifest_files = manifest_process.process_manifests(self, manifest_files);
         Ok(manifest_files)
@@ -395,12 +507,23 @@ impl<'a> SnapshotProducer<'a> {
 
         summary_collector.set_partition_summary_limit(partition_summary_limit);
 
-        for data_file in &self.added_data_files {
+        for data_file in self
+            .added_data_files
+            .iter()
+            .chain(self.added_delete_files.iter())
+        {
             summary_collector.add_file(
                 data_file,
                 table_metadata.current_schema().clone(),
                 table_metadata.default_partition_spec().clone(),
             );
+        }
+        for data_file in &self.removed_files {
+            let spec = table_metadata
+                .partition_spec_by_id(data_file.partition_spec_id)
+                .unwrap_or_else(|| table_metadata.default_partition_spec())
+                .clone();
+            summary_collector.remove_file(data_file, table_metadata.current_schema().clone(), spec);
         }
 
         let previous_snapshot = table_metadata.current_snapshot();
@@ -443,45 +566,13 @@ impl<'a> SnapshotProducer<'a> {
         process: MP,
     ) -> Result<ActionCommit> {
         let manifest_list_path = self.generate_manifest_list_file_path(0)?;
-        let next_seq_num = self.table.metadata().next_sequence_number();
         let first_row_id = self.table.metadata().next_row_id();
+        let (mut manifest_list_writer, encrypted_output) =
+            self.manifest_list_writer(&manifest_list_path).await?;
 
-        let raw_output = self
-            .table
-            .file_io()
-            .new_output(manifest_list_path.clone())?;
-
-        let (writer, encrypted_output) = match self.table.encryption_manager() {
-            Some(em) => {
-                let encrypted_output = em.encrypt(raw_output);
-                (
-                    encrypted_output.writer().await?,
-                    Some((em.clone(), encrypted_output)),
-                )
-            }
-            None => (raw_output.writer().await?, None),
-        };
-
-        let parent_snapshot_id = self.table.metadata().current_snapshot_id();
-        let mut manifest_list_writer = match self.table.metadata().format_version() {
-            FormatVersion::V1 => {
-                ManifestListWriter::v1(writer, self.snapshot_id, parent_snapshot_id)
-            }
-            FormatVersion::V2 => {
-                ManifestListWriter::v2(writer, self.snapshot_id, parent_snapshot_id, next_seq_num)
-            }
-            FormatVersion::V3 => ManifestListWriter::v3(
-                writer,
-                self.snapshot_id,
-                parent_snapshot_id,
-                next_seq_num,
-                Some(first_row_id),
-            ),
-        };
-
-        // Calling self.summary() before self.produce_manifests() is important because self.added_data_files
-        // will be set to an empty vec after self.produce_manifests() returns, resulting in an empty summary
-        // being generated.
+        // Calling self.summary() before self.produce_manifests() is important because the
+        // added_*_files vecs are drained by self.produce_manifests(), which would result in
+        // an empty summary being generated otherwise.
         let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
             Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
         })?;
@@ -503,24 +594,149 @@ impl<'a> SnapshotProducer<'a> {
             None => None,
         };
 
+        let row_range = writer_next_row_id.map(|writer_next_row_id| {
+            let assigned_rows = writer_next_row_id - self.table.metadata().next_row_id();
+            (first_row_id, assigned_rows)
+        });
+        Ok(self.snapshot_commit(manifest_list_path, summary, row_range, encryption_key_id))
+    }
+
+    /// Plan this snapshot without writing it: the [`ActionCommit`] that adds
+    /// it, and its files to write ([`StagedSnapshot`]). Its manifest list
+    /// carries the manifests the caller names when it writes it, rather
+    /// than reading the parent's: snapshots one commit chains can be
+    /// written together. V1 and v2 tables only — v3's row lineage takes
+    /// its range from the written manifest list — and unencrypted tables
+    /// only: an encrypted list's key, which the snapshot names, is only
+    /// known once the list is written.
+    pub(crate) async fn stage<OP: SnapshotProduceOperation>(
+        mut self,
+        snapshot_produce_operation: &OP,
+    ) -> Result<(ActionCommit, StagedSnapshot)> {
+        if self.table.metadata().format_version() == FormatVersion::V3 {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "staged snapshots don't support format version 3",
+            ));
+        }
+        if self.table.encryption_manager().is_some() {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "staged snapshots don't support encrypted tables",
+            ));
+        }
+        if self.added_data_files.is_empty()
+            && self.added_delete_files.is_empty()
+            && self.snapshot_properties.is_empty()
+        {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No added files or snapshot properties found when writing a manifest file",
+            ));
+        }
+        let manifest_list_path = self.generate_manifest_list_file_path(0)?;
+        let (list, _) = self.manifest_list_writer(&manifest_list_path).await?;
+        // Before the added files are taken below.
+        let summary = self.summary(snapshot_produce_operation).map_err(|err| {
+            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
+        })?;
+        let mut manifests = Vec::new();
+        if !self.added_data_files.is_empty() {
+            let added_data_files = std::mem::take(&mut self.added_data_files);
+            let seq = self.added_data_sequence_number;
+            manifests.push(self.added_manifest_writer(
+                added_data_files,
+                ManifestContentType::Data,
+                seq,
+            )?);
+        }
+        if !self.added_delete_files.is_empty() {
+            let added_delete_files = std::mem::take(&mut self.added_delete_files);
+            manifests.push(self.added_manifest_writer(
+                added_delete_files,
+                ManifestContentType::Deletes,
+                None,
+            )?);
+        }
+        let staged = StagedSnapshot {
+            manifests,
+            list,
+            sequence_number: self.table.metadata().next_sequence_number(),
+            format_version: self.table.metadata().format_version(),
+        };
+        Ok((
+            self.snapshot_commit(manifest_list_path, summary, None, None),
+            staged,
+        ))
+    }
+
+    /// A writer for this snapshot's manifest list at `path` — encrypted, on
+    /// a table with an encryption manager, which then names the list's key
+    /// once it's written.
+    async fn manifest_list_writer(
+        &self,
+        path: &str,
+    ) -> Result<(ManifestListWriter, ManifestListEncryption)> {
+        let next_seq_num = self.table.metadata().next_sequence_number();
+        let raw_output = self.table.file_io().new_output(path)?;
+        let (writer, encrypted_output) = match self.table.encryption_manager() {
+            Some(em) => {
+                let encrypted_output = em.encrypt(raw_output);
+                (
+                    encrypted_output.writer().await?,
+                    Some((em.clone(), encrypted_output)),
+                )
+            }
+            None => (raw_output.writer().await?, None),
+        };
+        let list = match self.table.metadata().format_version() {
+            FormatVersion::V1 => ManifestListWriter::v1(
+                writer,
+                self.snapshot_id,
+                self.table.metadata().current_snapshot_id(),
+            ),
+            FormatVersion::V2 => ManifestListWriter::v2(
+                writer,
+                self.snapshot_id,
+                self.table.metadata().current_snapshot_id(),
+                next_seq_num,
+            ),
+            FormatVersion::V3 => ManifestListWriter::v3(
+                writer,
+                self.snapshot_id,
+                self.table.metadata().current_snapshot_id(),
+                next_seq_num,
+                Some(self.table.metadata().next_row_id()),
+            ),
+        };
+        Ok((list, encrypted_output))
+    }
+
+    /// The commit adding this snapshot, its manifest list at
+    /// `manifest_list_path`, and making it the main branch's.
+    fn snapshot_commit(
+        &self,
+        manifest_list_path: String,
+        summary: Summary,
+        row_range: Option<(u64, u64)>,
+        encryption_key_id: Option<String>,
+    ) -> ActionCommit {
         let commit_ts = chrono::Utc::now().timestamp_millis();
         let new_snapshot = Snapshot::builder()
             .with_manifest_list(manifest_list_path)
             .with_snapshot_id(self.snapshot_id)
             .with_parent_snapshot_id(self.table.metadata().current_snapshot_id())
-            .with_sequence_number(next_seq_num)
+            .with_sequence_number(self.table.metadata().next_sequence_number())
             .with_summary(summary)
             .with_schema_id(self.table.metadata().current_schema_id())
             .with_encryption_key_id(encryption_key_id)
             .with_timestamp_ms(commit_ts);
 
-        let new_snapshot = if let Some(writer_next_row_id) = writer_next_row_id {
-            let assigned_rows = writer_next_row_id - self.table.metadata().next_row_id();
-            new_snapshot
+        let new_snapshot = match row_range {
+            Some((first_row_id, assigned_rows)) => new_snapshot
                 .with_row_range(first_row_id, assigned_rows)
-                .build()
-        } else {
-            new_snapshot.build()
+                .build(),
+            None => new_snapshot.build(),
         };
 
         let encryption_key_updates: Vec<TableUpdate> = self
@@ -562,6 +778,60 @@ impl<'a> SnapshotProducer<'a> {
             },
         ];
 
-        Ok(ActionCommit::new(updates, requirements))
+        ActionCommit::new(updates, requirements)
+    }
+}
+
+/// The table's encryption manager and the encrypted file a manifest list is
+/// written to, if the table is encrypted.
+type ManifestListEncryption = Option<(
+    std::sync::Arc<crate::encryption::EncryptionManager>,
+    crate::encryption::EncryptedOutputFile,
+)>;
+
+/// A snapshot planned but not written ([`crate::transaction::FastAppendAction::stage`]):
+/// its own manifests, written by [`Self::write_manifests`], then its
+/// manifest list, by [`Self::write_manifest_list`]. Each is a round trip to
+/// the object store; snapshots one commit chains can be written together,
+/// their manifests first, then their lists.
+pub struct StagedSnapshot {
+    manifests: Vec<ManifestWriter>,
+    list: ManifestListWriter,
+    sequence_number: i64,
+    format_version: FormatVersion,
+}
+
+impl StagedSnapshot {
+    /// Write the snapshot's own manifests, together. Returns them as its
+    /// manifest list records them — with its sequence number — so a later
+    /// snapshot's list can carry them.
+    pub async fn write_manifests(&mut self) -> Result<Vec<ManifestFile>> {
+        let written = std::mem::take(&mut self.manifests)
+            .into_iter()
+            .map(|writer| writer.write_manifest_file())
+            .collect::<futures::stream::FuturesOrdered<_>>()
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(written
+            .into_iter()
+            .map(|mut manifest| {
+                if self.format_version != FormatVersion::V1 {
+                    if manifest.sequence_number == crate::spec::UNASSIGNED_SEQUENCE_NUMBER {
+                        manifest.sequence_number = self.sequence_number;
+                    }
+                    if manifest.min_sequence_number == crate::spec::UNASSIGNED_SEQUENCE_NUMBER {
+                        manifest.min_sequence_number = self.sequence_number;
+                    }
+                }
+                manifest
+            })
+            .collect())
+    }
+
+    /// Write the snapshot's manifest list, naming `manifests`: the ones it
+    /// carries from its parent, then its own.
+    pub async fn write_manifest_list(mut self, manifests: Vec<ManifestFile>) -> Result<()> {
+        self.list.add_manifests(manifests.into_iter())?;
+        self.list.close().await.map(drop)
     }
 }

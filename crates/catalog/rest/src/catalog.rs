@@ -39,7 +39,10 @@ use reqwest::{Client, Method, StatusCode, Url};
 use tokio::sync::OnceCell;
 use typed_builder::TypedBuilder;
 
-use crate::auth::{AUTH_TYPE_NONE, AUTH_TYPE_OAUTH2, AuthManager, NoopAuthManager, OAuth2Manager};
+use crate::auth::{
+    AUTH_TYPE_NONE, AUTH_TYPE_OAUTH2, AUTH_TYPE_SIGV4, AuthManager, NoopAuthManager, OAuth2Manager,
+    SigV4AuthManager, sigv4_enabled,
+};
 use crate::client::{
     HttpClient, deserialize_catalog_response, deserialize_unexpected_catalog_error,
 };
@@ -769,7 +772,10 @@ impl RestSessionCatalog {
             // Matched case-insensitively, as the other flag properties are.
             .map(|auth_type| auth_type.to_ascii_lowercase())
             .unwrap_or_else(|| {
-                if config.token().is_some()
+                // The property Java's SigV4 signing was first enabled by.
+                if sigv4_enabled(&config.props) {
+                    AUTH_TYPE_SIGV4.to_string()
+                } else if config.token().is_some()
                     || config.credential().is_some()
                     || config.explicit_oauth2_server_uri().is_some()
                 {
@@ -800,6 +806,7 @@ impl RestSessionCatalog {
         match auth_type.as_str() {
             AUTH_TYPE_NONE => Ok(Arc::new(NoopAuthManager)),
             AUTH_TYPE_OAUTH2 => Ok(Arc::new(OAuth2Manager::from_config(config)?)),
+            AUTH_TYPE_SIGV4 => Ok(Arc::new(SigV4AuthManager::from_props(&config.props))),
             other => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -1245,6 +1252,12 @@ impl SessionCatalog for RestSessionCatalog {
             }
         };
 
+        // Stash the response-side config map BEFORE merging it with
+        // the catalog-level user_config — `Table::properties()`
+        // surfaces *only* the per-table response props so downstream
+        // consumers can spot vended credentials without re-issuing
+        // the request.
+        let response_config = response.config.clone();
         let config = response
             .config
             .into_iter()
@@ -1259,7 +1272,8 @@ impl SessionCatalog for RestSessionCatalog {
             .identifier(table_ident.clone())
             .file_io(file_io)
             .metadata(response.metadata)
-            .runtime(self.runtime.clone());
+            .runtime(self.runtime.clone())
+            .properties(response_config);
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
         }
@@ -2874,6 +2888,38 @@ mod tests {
                 test_catalog(with_endpoint).resolve_auth_manager().unwrap()
             )
             .contains("OAuth2Manager")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_type_sigv4() {
+        let manager = |props: &[(&str, &str)]| {
+            let config = RestCatalogConfig::builder()
+                .uri("http://localhost".to_string())
+                .props(
+                    props
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                )
+                .build();
+            format!("{:?}", test_catalog(config).resolve_auth_manager().unwrap())
+        };
+        // Explicitly, or through the property that first enabled it.
+        assert!(manager(&[(REST_CATALOG_PROP_AUTH_TYPE, "sigv4")]).contains("SigV4AuthManager"));
+        assert!(manager(&[("rest.sigv4-enabled", "true")]).contains("SigV4AuthManager"));
+        assert!(
+            manager(&[("rest.sigv4-enabled", "true"), ("token", "tok")])
+                .contains("SigV4AuthManager")
+        );
+        assert!(manager(&[("rest.sigv4-enabled", "false")]).contains("NoopAuthManager"));
+        // An explicit type wins.
+        assert!(
+            manager(&[
+                ("rest.sigv4-enabled", "true"),
+                (REST_CATALOG_PROP_AUTH_TYPE, "none")
+            ])
+            .contains("NoopAuthManager")
         );
     }
 
