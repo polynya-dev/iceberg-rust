@@ -40,8 +40,8 @@ use tokio::sync::OnceCell;
 use typed_builder::TypedBuilder;
 
 use crate::auth::{
-    AUTH_TYPE_NONE, AUTH_TYPE_OAUTH2, AUTH_TYPE_SIGV4, AuthManager, NoopAuthManager,
-    OAuth2Manager, SigV4AuthManager, sigv4_enabled,
+    AUTH_TYPE_NONE, AUTH_TYPE_OAUTH2, AUTH_TYPE_SIGV4, AuthManager, NoopAuthManager, OAuth2Manager,
+    SigV4AuthManager, sigv4_enabled,
 };
 use crate::client::{
     HttpClient, deserialize_catalog_response, deserialize_unexpected_catalog_error,

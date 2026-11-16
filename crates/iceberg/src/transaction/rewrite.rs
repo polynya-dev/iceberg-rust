@@ -405,7 +405,7 @@ mod tests {
 
         let manifest = table
             .manifest_reader()
-            .read(&data_manifests[0])
+            .read(data_manifests[0])
             .await
             .unwrap();
         assert_eq!(manifest.entries().len(), 1);
@@ -464,7 +464,7 @@ mod tests {
         let mut survivor_paths: Vec<String> = Vec::new();
         let mut added_paths: Vec<String> = Vec::new();
         for mf in &data_manifests {
-            let m = table.manifest_reader().read(&mf).await.unwrap();
+            let m = table.manifest_reader().read(mf).await.unwrap();
             for entry in m.entries() {
                 match entry.status() {
                     crate::spec::ManifestStatus::Existing => {
@@ -559,7 +559,7 @@ mod tests {
         // Every survivor and added file is reachable.
         let mut all_paths: Vec<String> = Vec::new();
         for mf in mlist.entries() {
-            let m = table.manifest_reader().read(&mf).await.unwrap();
+            let m = table.manifest_reader().read(mf).await.unwrap();
             for entry in m.entries() {
                 all_paths.push(entry.data_file().file_path().to_string());
             }
@@ -665,7 +665,7 @@ mod tests {
         let mlist = table.manifest_list_reader(snap).load().await.unwrap();
         let mut seqs = Vec::new();
         for mf in mlist.entries() {
-            let m = table.manifest_reader().read(&mf).await.unwrap();
+            let m = table.manifest_reader().read(mf).await.unwrap();
             for entry in m.entries() {
                 seqs.push((
                     entry.data_file().file_path().to_string(),
@@ -716,7 +716,7 @@ mod tests {
         let mlist = table.manifest_list_reader(snap).load().await.unwrap();
         let mut paths = Vec::new();
         for mf in mlist.entries() {
-            let m = table.manifest_reader().read(&mf).await.unwrap();
+            let m = table.manifest_reader().read(mf).await.unwrap();
             for entry in m.entries() {
                 paths.push(entry.data_file().file_path().to_string());
             }

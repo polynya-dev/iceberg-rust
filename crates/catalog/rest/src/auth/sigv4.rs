@@ -117,7 +117,9 @@ impl AuthManager for SigV4AuthManager {
         _client: &HttpClient,
         _props: &HashMap<String, String>,
     ) -> Result<Box<dyn AuthSession>> {
-        Ok(Box::new(self.session(self.region.clone(), self.name.clone())))
+        Ok(Box::new(
+            self.session(self.region.clone(), self.name.clone()),
+        ))
     }
 
     async fn catalog_session(
@@ -254,9 +256,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         SigV4AuthManager::from_props(&props).with_credentials_provider(
-            SharedCredentialsProvider::new(Credentials::new(
-                "AKID", "SECRET", None, None, "test",
-            )),
+            SharedCredentialsProvider::new(Credentials::new("AKID", "SECRET", None, None, "test")),
         )
     }
 
@@ -272,7 +272,10 @@ mod tests {
         let session = manager.catalog_session(&client, &props).await.unwrap();
         let mut request = HttpRequest::new(
             Client::new()
-                .request(Method::POST, "https://s3tables.eu-west-1.amazonaws.com/iceberg/v1/config")
+                .request(
+                    Method::POST,
+                    "https://s3tables.eu-west-1.amazonaws.com/iceberg/v1/config",
+                )
                 .body("{\"a\":1}")
                 .build()
                 .unwrap(),
