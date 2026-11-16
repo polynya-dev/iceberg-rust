@@ -26,6 +26,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
+use iceberg::spec::TableProperties;
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime,
@@ -1144,6 +1145,14 @@ impl SessionCatalog for RestSessionCatalog {
 
         let table_ident = TableIdent::new(namespace.clone(), creation.name.clone());
 
+        // The create request has no field for the format version: a REST
+        // catalog takes it from the `format-version` property, as Java's
+        // client sends it. Without it, the table gets the server's default.
+        let mut properties = creation.properties;
+        properties
+            .entry(TableProperties::PROPERTY_FORMAT_VERSION.to_string())
+            .or_insert_with(|| (creation.format_version as u8).to_string());
+
         let request = HttpRequest::build(
             client
                 .http_client
@@ -1155,7 +1164,7 @@ impl SessionCatalog for RestSessionCatalog {
                     partition_spec: creation.partition_spec,
                     write_order: creation.sort_order,
                     stage_create: Some(false),
-                    properties: creation.properties,
+                    properties,
                 }),
         )?;
 
@@ -3981,6 +3990,55 @@ mod tests {
             })],
             table.metadata().sort_orders_iter().collect::<Vec<_>>()
         );
+
+        config_mock.assert_async().await;
+        create_table_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_create_table_sends_its_format_version() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock(&mut server).await;
+
+        let create_table_mock = server
+            .mock("POST", "/v1/namespaces/ns1/tables")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "properties": {"format-version": "3", "owner": "testx"}
+            })))
+            .with_status(200)
+            .with_body_from_file(format!(
+                "{}/testdata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "create_table_response.json"
+            ))
+            .create_async()
+            .await;
+
+        let catalog = session_catalog(RestCatalogConfig::builder().uri(server.url()).build());
+
+        let table_creation = TableCreation::builder()
+            .name("test1".to_string())
+            .schema(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+            )
+            .properties(HashMap::from([("owner".to_string(), "testx".to_string())]))
+            .format_version(FormatVersion::V3)
+            .build();
+
+        catalog
+            .create_table(
+                &SessionContext::empty(),
+                &NamespaceIdent::from_strs(["ns1"]).unwrap(),
+                table_creation,
+            )
+            .await
+            .unwrap();
 
         config_mock.assert_async().await;
         create_table_mock.assert_async().await;
