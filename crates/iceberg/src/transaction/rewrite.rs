@@ -58,6 +58,7 @@ pub struct RewriteFilesAction {
     added_delete_files: Vec<DataFile>,
     removed_paths: HashSet<String>,
     data_sequence_number: Option<i64>,
+    validate_no_row_ids: bool,
 }
 
 impl RewriteFilesAction {
@@ -69,6 +70,7 @@ impl RewriteFilesAction {
             added_delete_files: vec![],
             removed_paths: HashSet::default(),
             data_sequence_number: None,
+            validate_no_row_ids: false,
         }
     }
 
@@ -122,6 +124,17 @@ impl RewriteFilesAction {
     /// deleted rows back. Java's `RewriteFiles.dataSequenceNumber`.
     pub fn set_data_sequence_number(mut self, data_sequence_number: i64) -> Self {
         self.data_sequence_number = Some(data_sequence_number);
+        self
+    }
+
+    /// Fail the commit if a removed data file has row ids: for a rewrite
+    /// whose added files store no row lineage, because it read its rows
+    /// before they had ids — before the table's upgrade to v3, and the
+    /// commit that then gave them theirs. Moved, they would take new ones,
+    /// where the spec requires a moved row to keep its `_row_id`. Checked
+    /// on every commit attempt, like the removed files being live.
+    pub fn validate_no_row_ids(mut self) -> Self {
+        self.validate_no_row_ids = true;
         self
     }
 }
@@ -215,6 +228,20 @@ impl RewriteFilesAction {
                 ErrorKind::CatalogCommitConflicts,
                 format!("Rewrite removes files no longer in the table: {missing:?}"),
             ));
+        }
+        if self.validate_no_row_ids {
+            let mut with_ids: Vec<&str> = removed
+                .iter()
+                .filter(|f| f.content_type() == DataContentType::Data && f.first_row_id().is_some())
+                .map(|f| f.file_path())
+                .collect();
+            if !with_ids.is_empty() {
+                with_ids.sort();
+                return Err(Error::new(
+                    ErrorKind::CatalogCommitConflicts,
+                    format!("Rewrite moves rows that have row ids, without them: {with_ids:?}"),
+                ));
+            }
         }
         Ok(removed)
     }
@@ -316,6 +343,12 @@ mod tests {
     use crate::{Catalog, CatalogBuilder, ErrorKind};
 
     async fn make_memory_table() -> (crate::memory::MemoryCatalog, crate::table::Table) {
+        make_memory_table_in(crate::spec::FormatVersion::V2).await
+    }
+
+    async fn make_memory_table_in(
+        format_version: crate::spec::FormatVersion,
+    ) -> (crate::memory::MemoryCatalog, crate::table::Table) {
         let schema = Schema::builder()
             .with_schema_id(0)
             .with_identifier_field_ids([1])
@@ -342,9 +375,88 @@ mod tests {
         let creation = crate::TableCreation::builder()
             .name("orders".to_string())
             .schema(schema)
+            .format_version(format_version)
             .build();
         let table = memory.create_table(&ns, creation).await.unwrap();
         (memory, table)
+    }
+
+    /// Each live data file's first row id in `table`'s current snapshot.
+    async fn first_row_ids(table: &crate::table::Table) -> HashMap<String, Option<i64>> {
+        let snap = table.metadata().current_snapshot().unwrap();
+        let list = table.manifest_list_reader(snap).load().await.unwrap();
+        let mut out = HashMap::new();
+        for m in list.entries() {
+            let manifest = table.manifest_reader().read(m).await.unwrap();
+            for e in manifest.entries().iter().filter(|e| e.is_alive()) {
+                let f = e.data_file();
+                out.insert(f.file_path().to_string(), f.first_row_id());
+            }
+        }
+        out
+    }
+
+    /// On a v3 table, the files a rewrite leaves in a manifest it rewrites
+    /// keep their first row ids — their rows keep their `_row_id`s.
+    #[tokio::test]
+    async fn rewrite_keeps_the_row_ids_of_the_files_it_leaves() {
+        let (catalog, table) = make_memory_table_in(crate::spec::FormatVersion::V3).await;
+        let f1 = data_file("memory:///warehouse/public/orders/data/1.parquet", 10, 1024);
+        let f2 = data_file("memory:///warehouse/public/orders/data/2.parquet", 20, 2048);
+        let tx = Transaction::new(&table);
+        let action = tx
+            .fast_append()
+            .with_check_duplicate(false)
+            .add_data_files(vec![f1.clone(), f2.clone()]);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+        let before = first_row_ids(&table).await;
+        assert_eq!(before[f2.file_path()], Some(10));
+
+        let compacted = data_file("memory:///warehouse/public/orders/data/c.parquet", 10, 512);
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .add_data_files(vec![compacted.clone()])
+            .remove_data_files(vec![f1.clone()]);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+        let after = first_row_ids(&table).await;
+        assert_eq!(after[f2.file_path()], Some(10), "{after:?}");
+        // Fresh ids, above every earlier one. (The rewritten manifest takes
+        // a range for the file it carries too, as Java's writer assigns one.)
+        assert!(after[compacted.file_path()] >= Some(30), "{after:?}");
+    }
+
+    /// A rewrite told its added files store no row lineage fails on files
+    /// whose rows have ids, and goes through on files whose rows don't.
+    #[tokio::test]
+    async fn rewrite_validating_no_row_ids_fails_on_files_with_them() {
+        for (format_version, fails) in [
+            (crate::spec::FormatVersion::V2, false),
+            (crate::spec::FormatVersion::V3, true),
+        ] {
+            let (catalog, table) = make_memory_table_in(format_version).await;
+            let f1 = data_file("memory:///warehouse/public/orders/data/1.parquet", 10, 1024);
+            let tx = Transaction::new(&table);
+            let action = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(vec![f1.clone()]);
+            let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+            let compacted = data_file("memory:///warehouse/public/orders/data/c.parquet", 10, 512);
+            let tx = Transaction::new(&table);
+            let action = tx
+                .rewrite_files()
+                .add_data_files(vec![compacted])
+                .remove_data_files(vec![f1])
+                .validate_no_row_ids();
+            let result = action.apply(tx).unwrap().commit(&catalog).await;
+            match result {
+                Err(e) if fails => assert_eq!(e.kind(), ErrorKind::CatalogCommitConflicts),
+                Ok(_) if !fails => {}
+                other => panic!("{format_version:?}: {:?}", other.map(|_| ())),
+            }
+        }
     }
 
     fn data_file(path: &str, record_count: u64, byte_size: u64) -> crate::spec::DataFile {
