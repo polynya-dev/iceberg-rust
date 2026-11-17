@@ -108,8 +108,9 @@ impl FastAppendAction {
     /// commit that adds it, and its files to write. For a chain of appends
     /// one commit lands, whose files are then written together — their
     /// manifests, then their manifest lists, each naming its parent's
-    /// manifests and its own. Doesn't check for duplicate files. V1 and v2
-    /// tables only.
+    /// manifests and its own. Doesn't check for duplicate files. On a v3
+    /// table, every manifest a list carries must have its row ids already
+    /// ([`StagedSnapshot::write_manifest_list`]).
     pub async fn stage(&self, table: &Table) -> Result<(ActionCommit, StagedSnapshot)> {
         let snapshot_producer = SnapshotProducer::new(
             table,
@@ -952,7 +953,9 @@ mod tests {
     }
 
     /// A fresh in-memory table, and its catalog.
-    async fn memory_table() -> (crate::memory::MemoryCatalog, Table) {
+    async fn memory_table_in(
+        format_version: crate::spec::FormatVersion,
+    ) -> (crate::memory::MemoryCatalog, Table) {
         use crate::spec::{NestedField, PrimitiveType, Schema, Type};
         use crate::{Catalog, CatalogBuilder};
         let schema = Schema::builder()
@@ -978,6 +981,7 @@ mod tests {
         let creation = crate::TableCreation::builder()
             .name("orders".to_string())
             .schema(schema)
+            .format_version(format_version)
             .build();
         let table = memory.create_table(&ns, creation).await.unwrap();
         (memory, table)
@@ -1010,8 +1014,9 @@ mod tests {
     }
 
     /// Each snapshot as its manifest list has it: per manifest, its content,
-    /// sequence numbers and the files it holds, with their sequence numbers.
-    async fn snapshots_as_listed(table: &Table) -> Vec<(i64, Vec<String>)> {
+    /// sequence numbers, first row id and the files it holds, with their
+    /// sequence numbers and first row ids; and the snapshot's row range.
+    async fn snapshots_as_listed(table: &Table) -> Vec<(i64, Option<(u64, u64)>, Vec<String>)> {
         let mut out = Vec::new();
         for snapshot in table.metadata().snapshots() {
             let list = table.manifest_list_reader(snapshot).load().await.unwrap();
@@ -1021,15 +1026,21 @@ mod tests {
                 let files: Vec<_> = manifest
                     .entries()
                     .iter()
-                    .map(|e| (e.file_path().to_string(), e.sequence_number()))
+                    .map(|e| {
+                        (
+                            e.file_path().to_string(),
+                            e.sequence_number(),
+                            e.data_file().first_row_id(),
+                        )
+                    })
                     .collect();
                 manifests.push(format!(
-                    "{:?} seq {} min {} {:?}",
-                    m.content, m.sequence_number, m.min_sequence_number, files
+                    "{:?} seq {} min {} first row id {:?} {:?}",
+                    m.content, m.sequence_number, m.min_sequence_number, m.first_row_id, files
                 ));
             }
             manifests.sort();
-            out.push((snapshot.sequence_number(), manifests));
+            out.push((snapshot.sequence_number(), snapshot.row_range(), manifests));
         }
         out.sort();
         out
@@ -1041,11 +1052,70 @@ mod tests {
     /// appends committed one after another.
     #[tokio::test]
     async fn a_staged_chain_of_appends_lands_as_appends_one_by_one() {
+        staged_chain_lands_as_appends_one_by_one(crate::spec::FormatVersion::V2).await;
+    }
+
+    /// As above, on a v3 table: each snapshot's rows take the row ids after
+    /// the last's — its data manifest records the first, and keeps it in
+    /// the later snapshots' lists — and the table's next row id follows.
+    #[tokio::test]
+    async fn a_staged_chain_of_appends_lands_as_appends_one_by_one_on_v3() {
+        staged_chain_lands_as_appends_one_by_one(crate::spec::FormatVersion::V3).await;
+    }
+
+    /// A v2 table's files, its first commit since an upgrade to v3 gives
+    /// row ids, in its manifest list: a staged snapshot, whose row range
+    /// counts its own rows only, refuses to carry them.
+    #[tokio::test]
+    async fn a_staged_snapshot_refuses_to_carry_files_without_row_ids() {
+        use crate::transaction::ApplyTransactionAction;
+
+        let (catalog, table) = memory_table_in(crate::spec::FormatVersion::V2).await;
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .with_check_duplicate(false)
+            .add_data_files(step_files(&table, 0))
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .upgrade_table_version()
+            .set_format_version(crate::spec::FormatVersion::V3)
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let (_, mut staged) = Transaction::new(&table)
+            .fast_append()
+            .with_check_duplicate(false)
+            .add_data_files(step_files(&table, 1))
+            .stage(&table)
+            .await
+            .unwrap();
+        let parent = table
+            .manifest_list_reader(table.metadata().current_snapshot().unwrap())
+            .load()
+            .await
+            .unwrap()
+            .entries()
+            .to_vec();
+        assert!(parent.iter().any(|m| m.first_row_id.is_none()));
+        let added = staged.write_manifests().await.unwrap();
+        let err = staged
+            .write_manifest_list(parent.into_iter().chain(added).collect())
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("without row ids"), "{err}");
+    }
+
+    async fn staged_chain_lands_as_appends_one_by_one(format_version: crate::spec::FormatVersion) {
         use crate::transaction::ApplyTransactionAction;
         use crate::{Catalog, TableCommit};
         const STEPS: usize = 3;
 
-        let (one_by_one_catalog, mut one_by_one) = memory_table().await;
+        let (one_by_one_catalog, mut one_by_one) = memory_table_in(format_version).await;
         for n in 0..STEPS {
             let tx = Transaction::new(&one_by_one);
             let files = step_files(&one_by_one, n);
@@ -1058,7 +1128,7 @@ mod tests {
             one_by_one = tx.commit(&one_by_one_catalog).await.unwrap();
         }
 
-        let (staged_catalog, table) = memory_table().await;
+        let (staged_catalog, table) = memory_table_in(format_version).await;
         let mut local = table.clone();
         let mut updates = Vec::new();
         let mut requirements = Vec::new();
@@ -1109,6 +1179,10 @@ mod tests {
         assert_eq!(
             snapshots_as_listed(&staged_table).await,
             snapshots_as_listed(&one_by_one).await
+        );
+        assert_eq!(
+            staged_table.metadata().next_row_id(),
+            one_by_one.metadata().next_row_id()
         );
         let summaries = |t: &Table| {
             let mut s: Vec<_> = t
