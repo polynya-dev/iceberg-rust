@@ -39,6 +39,8 @@ const REMOVED_EQUALITY_DELETE_FILES: &str = "removed-equality-delete-files";
 const REMOVED_FILE_SIZE: &str = "removed-files-size";
 const REMOVED_POSITION_DELETES: &str = "removed-position-deletes";
 const REMOVED_POSITION_DELETE_FILES: &str = "removed-position-delete-files";
+const ADDED_DVS: &str = "added-dvs";
+const REMOVED_DVS: &str = "removed-dvs";
 const TOTAL_EQUALITY_DELETES: &str = "total-equality-deletes";
 const TOTAL_POSITION_DELETES: &str = "total-position-deletes";
 const TOTAL_DATA_FILES: &str = "total-data-files";
@@ -179,6 +181,8 @@ struct UpdateMetrics {
     removed_eq_delete_files: u64,
     added_pos_delete_files: u64,
     removed_pos_delete_files: u64,
+    added_dvs: u64,
+    removed_dvs: u64,
     added_delete_files: u32,
     removed_delete_files: u32,
     added_records: u64,
@@ -189,9 +193,24 @@ struct UpdateMetrics {
     removed_eq_deletes: u64,
 }
 
+/// Whether `file` is a deletion vector: a blob in a Puffin file, of which
+/// the file may hold several.
+fn is_deletion_vector(file: &DataFile) -> bool {
+    file.content_type() == DataContentType::PositionDeletes
+        && file.file_format() == crate::spec::DataFileFormat::Puffin
+}
+
+/// What `file` takes up: a deletion vector, its blob — as Java counts it.
+fn content_size(file: &DataFile) -> u64 {
+    match file.content_size_in_bytes() {
+        Some(size) if is_deletion_vector(file) => size as u64,
+        _ => file.file_size_in_bytes,
+    }
+}
+
 impl UpdateMetrics {
     fn add_file(&mut self, data_file: &DataFile) {
-        self.added_file_size += data_file.file_size_in_bytes;
+        self.added_file_size += content_size(data_file);
         match data_file.content_type() {
             DataContentType::Data => {
                 self.added_data_files += 1;
@@ -199,7 +218,11 @@ impl UpdateMetrics {
             }
             DataContentType::PositionDeletes => {
                 self.added_delete_files += 1;
-                self.added_pos_delete_files += 1;
+                if is_deletion_vector(data_file) {
+                    self.added_dvs += 1;
+                } else {
+                    self.added_pos_delete_files += 1;
+                }
                 self.added_pos_deletes += data_file.record_count;
             }
             DataContentType::EqualityDeletes => {
@@ -211,7 +234,7 @@ impl UpdateMetrics {
     }
 
     fn remove_file(&mut self, data_file: &DataFile) {
-        self.removed_file_size += data_file.file_size_in_bytes;
+        self.removed_file_size += content_size(data_file);
         match data_file.content_type() {
             DataContentType::Data => {
                 self.removed_data_files += 1;
@@ -219,7 +242,11 @@ impl UpdateMetrics {
             }
             DataContentType::PositionDeletes => {
                 self.removed_delete_files += 1;
-                self.removed_pos_delete_files += 1;
+                if is_deletion_vector(data_file) {
+                    self.removed_dvs += 1;
+                } else {
+                    self.removed_pos_delete_files += 1;
+                }
                 self.removed_pos_deletes += data_file.record_count;
             }
             DataContentType::EqualityDeletes => {
@@ -271,6 +298,8 @@ impl UpdateMetrics {
             self.removed_pos_delete_files,
             REMOVED_POSITION_DELETE_FILES,
         );
+        set_if_positive(&mut properties, self.added_dvs, ADDED_DVS);
+        set_if_positive(&mut properties, self.removed_dvs, REMOVED_DVS);
         set_if_positive(&mut properties, self.added_delete_files, ADDED_DELETE_FILES);
         set_if_positive(
             &mut properties,
@@ -311,6 +340,8 @@ impl UpdateMetrics {
         self.removed_eq_delete_files += other.removed_eq_delete_files;
         self.added_pos_delete_files += other.added_pos_delete_files;
         self.removed_pos_delete_files += other.removed_pos_delete_files;
+        self.added_dvs += other.added_dvs;
+        self.removed_dvs += other.removed_dvs;
         self.added_delete_files += other.added_delete_files;
         self.removed_delete_files += other.removed_delete_files;
         self.added_records += other.added_records;

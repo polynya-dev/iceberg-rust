@@ -541,11 +541,9 @@ impl<'a> SnapshotProducer<'a> {
             additional_properties,
         };
 
-        update_snapshot_summaries(
-            summary,
-            previous_snapshot.map(|s| s.summary()),
-            snapshot_produce_operation.operation() == Operation::Overwrite,
-        )
+        // No action here overwrites the whole table: an `Overwrite` (a row
+        // delta) changes some of its files, which its summary counts.
+        update_snapshot_summaries(summary, previous_snapshot.map(|s| s.summary()), false)
     }
 
     fn generate_manifest_list_file_path(&self, attempt: i64) -> Result<String> {
