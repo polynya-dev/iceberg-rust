@@ -407,6 +407,58 @@ mod tests {
         action.apply(tx).unwrap().commit(catalog).await
     }
 
+    /// The manifests of `table`'s current snapshot holding deletes.
+    async fn delete_manifests(table: &Table) -> usize {
+        let snap = table.metadata().current_snapshot().unwrap();
+        let list = table.manifest_list_reader(snap).load().await.unwrap();
+        list.entries()
+            .iter()
+            .filter(|m| m.content == crate::spec::ManifestContentType::Deletes)
+            .count()
+    }
+
+    /// A commit replacing vectors of several manifests keeps the vectors
+    /// they hold that it doesn't replace in one manifest, beside the one it
+    /// adds. Rewritten one each, a table's delete manifests would multiply
+    /// with its commits, and each commit read and wrote more of them.
+    #[tokio::test]
+    async fn a_row_delta_keeps_the_survivors_of_the_manifests_it_touches_in_one() {
+        let (catalog, table) = table_in(FormatVersion::V3).await;
+        let files = ["a", "b", "c", "d"].map(|n| data(&format!("{n}.parquet")));
+        let table = append(&catalog, &table, files.to_vec()).await;
+        let of_a = vector("p1.puffin", 4, "a.parquet", 1);
+        let of_b = vector("p1.puffin", 44, "b.parquet", 1);
+        let table = delta(&catalog, &table, vec![of_a.clone(), of_b], vec![])
+            .await
+            .unwrap();
+        let of_c = vector("p2.puffin", 4, "c.parquet", 1);
+        let of_d = vector("p2.puffin", 44, "d.parquet", 1);
+        let table = delta(&catalog, &table, vec![of_c.clone(), of_d], vec![])
+            .await
+            .unwrap();
+        let replacing = vec![
+            vector("p3.puffin", 4, "a.parquet", 2),
+            vector("p3.puffin", 44, "c.parquet", 2),
+        ];
+        let table = delta(&catalog, &table, replacing, vec![&of_a, &of_c])
+            .await
+            .unwrap();
+        assert_eq!(
+            live(&table).await,
+            names(&[
+                "a.parquet",
+                "b.parquet",
+                "c.parquet",
+                "d.parquet",
+                "p1.puffin@44",
+                "p2.puffin@44",
+                "p3.puffin@4",
+                "p3.puffin@44",
+            ])
+        );
+        assert_eq!(delete_manifests(&table).await, 2);
+    }
+
     fn summary(table: &Table, key: &str) -> Option<String> {
         let snap = table.metadata().current_snapshot().unwrap();
         snap.summary().additional_properties.get(key).cloned()

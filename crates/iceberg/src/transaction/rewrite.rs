@@ -381,63 +381,61 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
 
 /// The manifests a snapshot that removes `removal`'s files carries from
 /// `manifests`, the current snapshot's: each that holds none of them
-/// unchanged; none that holds nothing else live; and the rest rewritten,
-/// their other live entries as `Existing` (each keeping its original
-/// `snapshot_id` and `sequence_number`). The entries earlier commits left
-/// `DELETED` — Java writes them for what it removes — aren't carried:
-/// rewritten as `Existing`, their files would be live again.
+/// unchanged, and the other live entries of those that do as `Existing`
+/// (each keeping its original `snapshot_id`, `sequence_number` and first
+/// row id). Those of every such manifest of the table's partition spec go
+/// in one manifest per content — data, deletes — so a table whose commits
+/// remove files from many manifests, as one replacing deletion vectors
+/// does, doesn't multiply its manifests (and every later commit's reads)
+/// one rewritten manifest each. A manifest of an older spec is rewritten
+/// alone. The entries earlier commits left `DELETED` — Java writes them
+/// for what it removes — aren't carried: rewritten as `Existing`, their
+/// files would be live again.
 pub(super) async fn carry_manifests(
     snapshot_produce: &mut SnapshotProducer<'_>,
     manifests: &[(ManifestFile, Manifest)],
     removal: &Removal,
 ) -> Result<Vec<ManifestFile>> {
-    // Pass 1: classify each manifest based on its loaded entries. We
-    // can't write rewritten manifests yet because that needs `&mut
-    // snapshot_produce`, and we also need the producer to compute
-    // file-IO paths during this loop.
-    enum Plan {
-        CarryForward(ManifestFile),
-        DropEntirely,
-        Rewrite {
-            survivors: Vec<ManifestEntry>,
-            content: crate::spec::ManifestContentType,
-        },
-    }
-    let mut plans: Vec<Plan> = Vec::with_capacity(manifests.len());
+    let spec_id = snapshot_produce
+        .table
+        .metadata()
+        .default_partition_spec_id();
+    let mut out: Vec<ManifestFile> = Vec::with_capacity(manifests.len());
+    // The other live entries of the manifests holding removed files, by
+    // content: of the table's spec together, of an older one apart.
+    let mut together: Vec<(crate::spec::ManifestContentType, Vec<ManifestEntry>)> = Vec::new();
+    let mut apart: Vec<(crate::spec::ManifestContentType, Vec<ManifestEntry>)> = Vec::new();
     for (mfile, manifest) in manifests {
         let alive = manifest.entries().iter().filter(|me| me.is_alive());
-        let removes_any = alive.clone().any(|me| removal.contains(me.data_file()));
+        if !alive.clone().any(|me| removal.contains(me.data_file())) {
+            out.push(mfile.clone());
+            continue;
+        }
         let survivors: Vec<ManifestEntry> = alive
             .filter(|me| !removal.contains(me.data_file()))
             .map(|me| ManifestEntry::clone(me))
             .collect();
-
-        if !removes_any {
-            plans.push(Plan::CarryForward(mfile.clone()));
-        } else if survivors.is_empty() {
-            plans.push(Plan::DropEntirely);
-        } else {
-            plans.push(Plan::Rewrite {
-                survivors,
-                content: mfile.content,
-            });
+        if survivors.is_empty() {
+            continue;
+        }
+        if mfile.partition_spec_id != spec_id {
+            apart.push((mfile.content, survivors));
+            continue;
+        }
+        match together
+            .iter_mut()
+            .find(|(content, _)| *content == mfile.content)
+        {
+            Some((_, entries)) => entries.extend(survivors),
+            None => together.push((mfile.content, survivors)),
         }
     }
-
-    // Pass 2: materialize. Carry-forwards and rewrites land in the
-    // output; drops produce nothing.
-    let mut out: Vec<ManifestFile> = Vec::with_capacity(plans.len());
-    for plan in plans {
-        match plan {
-            Plan::CarryForward(mf) => out.push(mf),
-            Plan::DropEntirely => {}
-            Plan::Rewrite { survivors, content } => {
-                let rewritten = snapshot_produce
-                    .write_existing_manifest_for(survivors, content)
-                    .await?;
-                out.push(rewritten);
-            }
-        }
+    for (content, survivors) in together.into_iter().chain(apart) {
+        out.push(
+            snapshot_produce
+                .write_existing_manifest_for(survivors, content)
+                .await?,
+        );
     }
     Ok(out)
 }
@@ -535,6 +533,54 @@ mod tests {
         // Fresh ids, above every earlier one. (The rewritten manifest takes
         // a range for the file it carries too, as Java's writer assigns one.)
         assert!(after[compacted.file_path()] >= Some(30), "{after:?}");
+    }
+
+    /// A rewrite removing files of several manifests keeps the files they
+    /// hold that it doesn't remove in one manifest, beside the one it adds
+    /// — with their first row ids, on a v3 table.
+    #[tokio::test]
+    async fn rewrite_keeps_the_survivors_of_the_manifests_it_touches_in_one() {
+        let (catalog, table) = make_memory_table_in(crate::spec::FormatVersion::V3).await;
+        let file = |n: &str| {
+            data_file(
+                &format!("memory:///warehouse/public/orders/data/{n}"),
+                10,
+                1024,
+            )
+        };
+        let mut table = table;
+        for pair in [["1.parquet", "2.parquet"], ["3.parquet", "4.parquet"]] {
+            let tx = Transaction::new(&table);
+            let action = tx
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(pair.map(file).to_vec());
+            table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+        }
+        let before = first_row_ids(&table).await;
+
+        let compacted = file("c.parquet");
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .add_data_files(vec![compacted.clone()])
+            .remove_data_files(vec![file("1.parquet"), file("3.parquet")]);
+        let table = action.apply(tx).unwrap().commit(&catalog).await.unwrap();
+
+        let snap = table.metadata().current_snapshot().unwrap();
+        let list = table.manifest_list_reader(snap).load().await.unwrap();
+        let data_manifests = list
+            .entries()
+            .iter()
+            .filter(|m| m.content == ManifestContentType::Data)
+            .count();
+        assert_eq!(data_manifests, 2);
+        let after = first_row_ids(&table).await;
+        for kept in ["2.parquet", "4.parquet"] {
+            let path = file(kept).file_path().to_string();
+            assert_eq!(after[&path], before[&path], "{after:?}");
+        }
+        assert_eq!(after.len(), 3, "{after:?}");
     }
 
     /// A rewrite told its added files store no row lineage fails on files
